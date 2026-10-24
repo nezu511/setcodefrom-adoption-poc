@@ -1,0 +1,1101 @@
+diff --git a/packages/testing/src/execution_testing/forks/forks/eips/bogota/eip_8298.py b/packages/testing/src/execution_testing/forks/forks/eips/bogota/eip_8298.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7be2a178a98843ce4f10e51f88f06434212b1ac6
+--- /dev/null
++++ b/packages/testing/src/execution_testing/forks/forks/eips/bogota/eip_8298.py
+@@ -0,0 +1,57 @@
++"""
++EIP-8298: SETCODEFROM Code Reuse Instruction.
++
++Adds an instruction that sets an account's code hash from an existing
++deployed contract.
++
++https://eips.ethereum.org/EIPS/eip-8298
++"""
++
++from typing import Callable, Dict, List
++
++from execution_testing.vm import OpcodeBase, Opcodes
++
++from ....base_fork import BaseFork
++from ....gas_costs import GasCosts
++
++
++class EIP8298(BaseFork):
++    """EIP-8298 class."""
++
++    @classmethod
++    def valid_opcodes(cls) -> List[Opcodes]:
++        """Add SETCODEFROM."""
++        return [Opcodes.SETCODEFROM] + super(EIP8298, cls).valid_opcodes()
++
++    @classmethod
++    def opcode_gas_map(
++        cls,
++    ) -> Dict[OpcodeBase, int | Callable[[OpcodeBase], int]]:
++        """Add the SETCODEFROM gas cost."""
++        gas_costs = cls.gas_costs()
++        return {
++            **super(EIP8298, cls).opcode_gas_map(),
++            Opcodes.SETCODEFROM: lambda op: cls._calculate_setcodefrom_gas(
++                op, gas_costs
++            ),
++        }
++
++    @classmethod
++    def _calculate_setcodefrom_gas(
++        cls, opcode: OpcodeBase, gas_costs: GasCosts
++    ) -> int:
++        """
++        Charge the source lookup, then the current-account access for a
++        valid source, then the write for a changed code hash.
++        """
++        gas = gas_costs.WARM_ACCESS + (
++            gas_costs.WARM_ACCESS
++            if opcode.metadata["address_warm"]
++            else gas_costs.COLD_ACCOUNT_ACCESS
++        )
++        if not opcode.metadata["source_valid"]:
++            return gas
++        gas += gas_costs.WARM_ACCESS
++        if opcode.metadata["code_changed"]:
++            gas += gas_costs.ACCOUNT_WRITE
++        return gas
+diff --git a/packages/testing/src/execution_testing/test_types/block_access_list/account_absent_values.py b/packages/testing/src/execution_testing/test_types/block_access_list/account_absent_values.py
+index 3f57082bd1a9ee48f0eb2957e9af86224dc308b9..0f88277ef5711b84d261d102e83f5092d8582634 100644
+--- a/packages/testing/src/execution_testing/test_types/block_access_list/account_absent_values.py
++++ b/packages/testing/src/execution_testing/test_types/block_access_list/account_absent_values.py
+@@ -201,6 +201,7 @@ class BalAccountAbsentValues(CamelModel):
+             lambda a, f: (
+                 a.block_access_index == f.block_access_index
+                 and a.new_code == f.new_code
++                and a.new_code_hash == f.new_code_hash
+             ),
+             lambda a: (
+                 f"Unexpected code change found at tx {a.block_access_index}"
+diff --git a/packages/testing/src/execution_testing/test_types/block_access_list/account_changes.py b/packages/testing/src/execution_testing/test_types/block_access_list/account_changes.py
+index ec1a2ba521ddff78fb95db434bba54fd3c4faef4..8a99c290084b7969a870fe119461defd51510cc6 100644
+--- a/packages/testing/src/execution_testing/test_types/block_access_list/account_changes.py
++++ b/packages/testing/src/execution_testing/test_types/block_access_list/account_changes.py
+@@ -13,6 +13,7 @@ from execution_testing.base_types import (
+     Address,
+     Bytes,
+     CamelModel,
++    Hash,
+     RLPSerializable,
+     ZeroPaddedHexNumber,
+ )
+@@ -53,9 +54,29 @@ class BalCodeChange(CamelModel, RLPSerializable):
+         ZeroPaddedHexNumber(1),
+         description="Transaction index where the change occurred",
+     )
+-    new_code: Bytes = Field(..., description="New code bytes")
++    new_code: Bytes = Field(
++        ..., description="New code bytes; empty for an adoption"
++    )
++    new_code_hash: Hash | None = Field(
++        None,
++        description="Code hash adopted via SETCODEFROM (EIP-8298)",
++    )
++
++    rlp_fields: ClassVar[List[str]] = [
++        "block_access_index",
++        "new_code",
++        "new_code_hash",
++    ]
++    rlp_exclude_none: ClassVar[bool] = True
+ 
+-    rlp_fields: ClassVar[List[str]] = ["block_access_index", "new_code"]
++    @model_validator(mode="after")
++    def _check_code_exclusive_with_hash(self) -> Self:
++        """A hash-form adoption must not also carry bytecode."""
++        if self.new_code_hash is not None and self.new_code != b"":
++            raise ValueError(
++                "new_code must be empty when new_code_hash is set"
++            )
++        return self
+ 
+ 
+ class BalStorageChange(CamelModel, RLPSerializable):
+diff --git a/packages/testing/src/execution_testing/test_types/block_access_list/expectations.py b/packages/testing/src/execution_testing/test_types/block_access_list/expectations.py
+index 417f59e9439a8eb8a9abf47919f4335ea46d680a..790382e16c4814b64d8a6c8af6d440b04e221f7a 100644
+--- a/packages/testing/src/execution_testing/test_types/block_access_list/expectations.py
++++ b/packages/testing/src/execution_testing/test_types/block_access_list/expectations.py
+@@ -451,6 +451,8 @@ class BlockAccessListExpectation(CamelModel):
+             else:
+                 # Handle nonce_changes, balance_changes, code_changes
+                 # Create tuples for comparison (ordering already validated)
++                expected_tuples: List[tuple[Any, ...]]
++                actual_tuples: List[tuple[Any, ...]]
+                 if field_name == "nonce_changes":
+                     expected_tuples = [
+                         (c.block_access_index, c.post_nonce)
+@@ -473,11 +475,11 @@ class BlockAccessListExpectation(CamelModel):
+                     item_type = "balance"
+                 elif field_name == "code_changes":
+                     expected_tuples = [
+-                        (c.block_access_index, bytes(c.new_code))
++                        (c.block_access_index, c.new_code, c.new_code_hash)
+                         for c in expected_list
+                     ]
+                     actual_tuples = [
+-                        (c.block_access_index, bytes(c.new_code))
++                        (c.block_access_index, c.new_code, c.new_code_hash)
+                         for c in actual_list
+                     ]
+                     item_type = "code"
+diff --git a/packages/testing/src/execution_testing/test_types/block_access_list/t8n.py b/packages/testing/src/execution_testing/test_types/block_access_list/t8n.py
+index df807f3f6d432e82ba8713a57c2c25ab513fd3a3..f5546eabf589f152fc7ca6e94085ddda7e0ac1f2 100644
+--- a/packages/testing/src/execution_testing/test_types/block_access_list/t8n.py
++++ b/packages/testing/src/execution_testing/test_types/block_access_list/t8n.py
+@@ -1,7 +1,7 @@
+ """Block Access List (BAL) for t8n tool communication and fixtures."""
+ 
+ from functools import cached_property
+-from typing import Any, Callable, List, Self, Sequence, Union
++from typing import Any, List, Self, Sequence, Union
+ 
+ import ethereum_rlp as eth_rlp
+ from ethereum_rlp import Simple
+@@ -11,6 +11,7 @@ from execution_testing.base_types import (
+     Address,
+     Bytes,
+     EthereumTestRootModel,
++    Hash,
+     ZeroPaddedHexNumber,
+ )
+ from execution_testing.base_types.serialization import (
+@@ -48,9 +49,7 @@ def _seq_from_rlp(data: Simple) -> Sequence[Simple]:
+     return data
+ 
+ 
+-IndexedChange = Union[
+-    BalBalanceChange, BalCodeChange, BalNonceChange, BalStorageChange
+-]
++IndexedChange = Union[BalBalanceChange, BalNonceChange, BalStorageChange]
+ 
+ 
+ def _hex_from_rlp(data: Simple) -> ZeroPaddedHexNumber:
+@@ -62,7 +61,6 @@ def _decode_indexed_changes(
+     rlp_list: Simple,
+     cls: type[IndexedChange],
+     value_field: str,
+-    value_fn: Callable[[Simple], Any] = _hex_from_rlp,
+ ) -> list[IndexedChange]:
+     """Decode a list of [block_access_index, value] RLP pairs."""
+     result: list[IndexedChange] = []
+@@ -71,7 +69,26 @@ def _decode_indexed_changes(
+         result.append(
+             cls(
+                 block_access_index=_hex_from_rlp(idx),
+-                **{value_field: value_fn(val)},
++                **{value_field: _hex_from_rlp(val)},
++            )
++        )
++    return result
++
++
++def _decode_code_changes(rlp_list: Simple) -> list[BalCodeChange]:
++    """Decode `[index, code]` or `[index, b"", code_hash]` entries."""
++    result: list[BalCodeChange] = []
++    for item in _seq_from_rlp(rlp_list):
++        idx, code, *code_hash = _seq_from_rlp(item)
++        if len(code_hash) > 1:
++            raise ValueError(f"code change has {len(code_hash) + 2} elements")
++        result.append(
++            BalCodeChange(
++                block_access_index=_hex_from_rlp(idx),
++                new_code=Bytes(_bytes_from_rlp(code)),
++                new_code_hash=(
++                    Hash(_bytes_from_rlp(code_hash[0])) if code_hash else None
++                ),
+             )
+         )
+     return result
+@@ -145,12 +162,7 @@ class BlockAccessList(EthereumTestRootModel[List[BalAccountChange]]):
+                     nonce_changes=_decode_indexed_changes(
+                         fields[4], BalNonceChange, "post_nonce"
+                     ),
+-                    code_changes=_decode_indexed_changes(
+-                        fields[5],
+-                        BalCodeChange,
+-                        "new_code",
+-                        value_fn=lambda v: Bytes(_bytes_from_rlp(v)),
+-                    ),
++                    code_changes=_decode_code_changes(fields[5]),
+                 )
+             )
+ 
+diff --git a/packages/testing/src/execution_testing/test_types/tests/test_block_access_list_expectation.py b/packages/testing/src/execution_testing/test_types/tests/test_block_access_list_expectation.py
+index 4f56cdf96cec09cf4b05c9d5b6b958bcb4561f8d..05b8fbf0a3d8058c801029ec4bbe3b349151cc84 100644
+--- a/packages/testing/src/execution_testing/test_types/tests/test_block_access_list_expectation.py
++++ b/packages/testing/src/execution_testing/test_types/tests/test_block_access_list_expectation.py
+@@ -4,7 +4,7 @@ from typing import Any
+ 
+ import pytest
+ 
+-from execution_testing.base_types import Address, Bytes, StorageKey
++from execution_testing.base_types import Address, Bytes, Hash, StorageKey
+ from execution_testing.test_types.block_access_list import (
+     BalAccountAbsentValues,
+     BalAccountChange,
+@@ -766,6 +766,59 @@ def test_absent_values_code_changes(has_change_should_raise: bool) -> None:
+         expectation.verify_against(actual_bal)
+ 
+ 
++@pytest.mark.parametrize(
++    "actual_hash,matches",
++    [
++        pytest.param(Hash(1), True, id="same_hash"),
++        pytest.param(Hash(2), False, id="other_hash"),
++        pytest.param(None, False, id="code_cleared"),
++    ],
++)
++def test_code_change_hash_must_match(
++    actual_hash: Hash | None, matches: bool
++) -> None:
++    """A hash-form code change matches only the same `new_code_hash`."""
++    alice = Address(0xA)
++    change = BalCodeChange(
++        block_access_index=1, new_code=b"", new_code_hash=Hash(1)
++    )
++    actual_bal = BlockAccessList(
++        [
++            BalAccountChange(
++                address=alice,
++                code_changes=[
++                    BalCodeChange(
++                        block_access_index=1,
++                        new_code=b"",
++                        new_code_hash=actual_hash,
++                    )
++                ],
++            )
++        ]
++    )
++    expected = BlockAccessListExpectation(
++        account_expectations={
++            alice: BalAccountExpectation(code_changes=[change])
++        }
++    )
++    forbidden = BlockAccessListExpectation(
++        account_expectations={
++            alice: BalAccountExpectation(
++                absent_values=BalAccountAbsentValues(code_changes=[change])
++            )
++        }
++    )
++
++    if matches:
++        expected.verify_against(actual_bal)
++        with pytest.raises(Exception, match="Unexpected code change"):
++            forbidden.verify_against(actual_bal)
++    else:
++        with pytest.raises(BlockAccessListValidationError):
++            expected.verify_against(actual_bal)
++        forbidden.verify_against(actual_bal)
++
++
+ def test_multiple_absent_valuess() -> None:
+     """Test multiple absence validators working together."""
+     contract = Address(0xC)
+diff --git a/packages/testing/src/execution_testing/test_types/tests/test_block_access_list_serialization.py b/packages/testing/src/execution_testing/test_types/tests/test_block_access_list_serialization.py
+index d29eb3d117e2c1d25d1e25d0fd43fbbf2b8145ba..4bc4b9c70c469cf6d24013d781b666fa00a83627 100644
+--- a/packages/testing/src/execution_testing/test_types/tests/test_block_access_list_serialization.py
++++ b/packages/testing/src/execution_testing/test_types/tests/test_block_access_list_serialization.py
+@@ -10,7 +10,7 @@ from typing import Any
+ import pytest
+ from pydantic import ValidationError
+ 
+-from execution_testing.base_types import Address, Bytes
++from execution_testing.base_types import Address, Bytes, Hash
+ from execution_testing.test_types.block_access_list import (
+     BalAccountChange,
+     BalBalanceChange,
+@@ -132,3 +132,32 @@ def test_bal_rlp_override_coerces_to_bytes(rlp: Any) -> None:
+ 
+     assert overridden.rlp == Bytes(b"\xc0")
+     assert overridden.rlp_hash == Bytes(b"\xc0").keccak256()
++
++
++def test_bal_code_change_hash_form_roundtrip() -> None:
++    """A `new_code_hash` entry round-trips as a 3-element RLP list."""
++    bal = BlockAccessList(
++        [
++            BalAccountChange(
++                address=Address(0xA),
++                code_changes=[
++                    BalCodeChange(block_access_index=1, new_code=b"\x00"),
++                    BalCodeChange(
++                        block_access_index=2,
++                        new_code=b"",
++                        new_code_hash=Hash(1),
++                    ),
++                ],
++            )
++        ]
++    )
++
++    assert BlockAccessList.from_rlp(bal.rlp) == bal
++    code_changes = bal.root[0].code_changes
++    assert len(code_changes[0].to_list()) == 2
++    assert len(code_changes[1].to_list()) == 3
++
++    with pytest.raises(ValidationError):
++        BalCodeChange(
++            block_access_index=1, new_code=b"\x01", new_code_hash=Hash(1)
++        )
+diff --git a/packages/testing/src/execution_testing/vm/opcodes.py b/packages/testing/src/execution_testing/vm/opcodes.py
+index f468bab77a6d1a7636bdd29e4a020df676892e0c..4d2e68da56106c9986d4dd5082aa0bbf43a0ed1c 100644
+--- a/packages/testing/src/execution_testing/vm/opcodes.py
++++ b/packages/testing/src/execution_testing/vm/opcodes.py
+@@ -5274,6 +5274,55 @@ class Opcodes(Opcode, Enum):
+     Source: [evm.codes/#A4](https://www.evm.codes/#A4)
+     """
+ 
++    SETCODEFROM = Opcode(
++        0xA7,
++        popped_stack_items=1,
++        pushed_stack_items=1,
++        kwargs=["source"],
++        metadata={
++            "address_warm": False,
++            "source_valid": False,
++            "code_changed": False,
++        },
++    )
++    """
++    SETCODEFROM(source) = success
++    ----
++
++    Description
++    ----
++    Set the current account's code hash to the code hash of an existing
++    deployed contract
++
++    Inputs
++    ----
++    - source: 20-byte address of the account whose code hash is adopted
++
++    Outputs
++    ----
++    - success: 1 if source is a valid source account, 0 otherwise
++
++    Fork
++    ----
++    Bogota
++
++    Gas
++    ----
++    - static_gas = 0
++    - dynamic_gas = SOURCE_ACCOUNT_ACCESS_COST + WARM_ACCESS, plus
++      WARM_ACCESS if source is valid, plus ACCOUNT_WRITE if the code hash
++      changes
++
++    Metadata
++    ----
++    - address_warm: whether source is already warm (default: False)
++    - source_valid: whether source is a valid source account (default: False)
++    - code_changed: whether the current account's code hash changes
++      (default: False)
++
++    Source: [EIP-8298](https://eips.ethereum.org/EIPS/eip-8298)
++    """
++
+     DUPN = Opcode(
+         0xE6,
+         pushed_stack_items=1,
+diff --git a/src/ethereum/forks/bogota/__init__.py b/src/ethereum/forks/bogota/__init__.py
+index bd56f4690b25a2d8e091878d3c9a82596aa0a1d4..848bcfb15601869927b077febe1943157dbac7fa 100644
+--- a/src/ethereum/forks/bogota/__init__.py
++++ b/src/ethereum/forks/bogota/__init__.py
+@@ -1,15 +1,16 @@
+ """
+-The Bogota fork ([EIP-8081]) is the development fork after Amsterdam. It
+-carries no protocol changes yet: EIPs targeting it are prototyped on their
+-own branches and land here once accepted.
++The Bogota fork ([EIP-8081]) is the development fork after Amsterdam. EIPs
++targeting it are prototyped on their own branches and land here once
++accepted.
+ 
+ ### Changes
+ 
+-None yet.
++- [EIP-8298: SETCODEFROM Code Reuse Instruction][EIP-8298]
+ 
+ ### Releases
+ 
+ [EIP-8081]: https://eips.ethereum.org/EIPS/eip-8081
++[EIP-8298]: https://eips.ethereum.org/EIPS/eip-8298
+ """
+ 
+ from ethereum.fork_criteria import ForkCriteria, Unscheduled
+diff --git a/src/ethereum/forks/bogota/block_access_lists.py b/src/ethereum/forks/bogota/block_access_lists.py
+index a5d53ebb08e88eaadea88a7399f5e6a1efbd0441..1fd5e39db55b35a0897c862f4814bcae27fde093 100644
+--- a/src/ethereum/forks/bogota/block_access_lists.py
++++ b/src/ethereum/forks/bogota/block_access_lists.py
+@@ -136,6 +136,41 @@ class CodeChange:
+     """
+ 
+ 
++@final
++@slotted_freezable
++@dataclass
++class AdoptedCodeChange:
++    """
++    In a [`BlockAccessList`][bal], represents an [`Account`] adopting the
++    code of another account through [`SETCODEFROM`]. The change records the
++    adopted code hash instead of the bytecode, which is already in the state
++    or in an earlier code change.
++
++    [bal]: ref:ethereum.forks.bogota.block_access_lists.BlockAccessList
++    [`Account`]: ref:ethereum.state.Account
++    [`SETCODEFROM`]: ref:ethereum.forks.bogota.vm.instructions.system.setcodefrom
++    """  # noqa: E501
++
++    block_access_index: BlockAccessIndex
++    """
++    Position within the set of all changes in a [`Block`].
++
++    [`Block`]: ref:ethereum.forks.bogota.blocks.Block
++    """
++
++    new_code: Bytes
++    """
++    Always empty: the code is identified by `new_code_hash`.
++    """
++
++    new_code_hash: Hash32
++    """
++    Code hash of an [`Account`] after this change has been applied.
++
++    [`Account`]: ref:ethereum.state.Account
++    """
++
++
+ @final
+ @slotted_freezable
+ @dataclass
+@@ -205,7 +240,7 @@ class AccountChanges:
+     [`Account`]: ref:ethereum.state.Account
+     """
+ 
+-    code_changes: Tuple[CodeChange, ...]
++    code_changes: Tuple[CodeChange | AdoptedCodeChange, ...]
+     """
+     Writes to the code of the associated [`Account`].
+ 
+@@ -273,7 +308,9 @@ class AccountData:
+     List of nonce changes for this account, ordered by transaction index.
+     """
+ 
+-    code_changes: List[CodeChange] = field(default_factory=list)
++    code_changes: List[CodeChange | AdoptedCodeChange] = field(
++        default_factory=list
++    )
+     """
+     List of code changes (contract deployments) for this account,
+     ordered by transaction index.
+@@ -476,20 +513,21 @@ def add_nonce_change(
+ def add_code_change(
+     builder: BlockAccessListBuilder,
+     address: Address,
+-    block_access_index: BlockAccessIndex,
+-    new_code: Bytes,
++    change: CodeChange | AdoptedCodeChange,
+ ) -> None:
+     """
+     Add a code change to the block access list.
+ 
+     Records contract code deployment or modification. This typically occurs
+     during contract creation via [`CREATE`], [`CREATE2`], or
+-    [`SetCodeTransaction`][sct] operations.
++    [`SetCodeTransaction`][sct] operations, or when an account adopts the code
++    of another account through [`SETCODEFROM`].
+ 
+     [`CREATE`]: ref:ethereum.forks.bogota.vm.instructions.system.create
+     [`CREATE2`]: ref:ethereum.forks.bogota.vm.instructions.system.create2
+     [sct]: ref:ethereum.forks.bogota.transactions.SetCodeTransaction
+-    """
++    [`SETCODEFROM`]: ref:ethereum.forks.bogota.vm.instructions.system.setcodefrom
++    """  # noqa: E501
+     ensure_account(builder, address)
+ 
+     # Check if we already have a code change for this block_access_index
+@@ -497,20 +535,15 @@ def add_code_change(
+     # first deployed and then cleared in the same transaction
+     existing_changes = builder.accounts[address].code_changes
+     for i, existing in enumerate(existing_changes):
+-        if existing.block_access_index == block_access_index:
++        if existing.block_access_index == change.block_access_index:
+             # Replace the existing code change with the new one
+             # For selfdestructs, this ensures we only record the final
+             # state (empty code)
+-            existing_changes[i] = CodeChange(
+-                block_access_index=block_access_index, new_code=new_code
+-            )
++            existing_changes[i] = change
+             return
+ 
+     # No existing change for this block_access_index, add a new one
+-    change = CodeChange(
+-        block_access_index=block_access_index, new_code=new_code
+-    )
+-    builder.accounts[address].code_changes.append(change)
++    existing_changes.append(change)
+ 
+ 
+ def remove_storage_write(
+@@ -804,11 +837,37 @@ def update_builder_from_tx(
+         post_code_hash = (
+             post_account.code_hash if post_account else EMPTY_CODE_HASH
+         )
+-        if pre_code_hash != post_code_hash:
+-            post_code = get_code(tx_state, post_code_hash)
+-            add_code_change(builder, address, idx, post_code)
+-        else:
++        tx_start_account = _get_pre_tx_account(
++            block_state.account_writes, block_state.pre_state, address
++        )
++        tx_start_code_hash = (
++            tx_start_account.code_hash if tx_start_account else EMPTY_CODE_HASH
++        )
++        if pre_code_hash == post_code_hash:
+             remove_code_change(builder, address, idx)
++        elif tx_start_code_hash == post_code_hash:
++            # The code was changed by an earlier transaction at this index,
++            # whose entry already records it in the right form.
++            pass
++        elif address in tx_state.accounts_with_adopted_code:
++            add_code_change(
++                builder,
++                address,
++                AdoptedCodeChange(
++                    block_access_index=idx,
++                    new_code=Bytes(b""),
++                    new_code_hash=post_code_hash,
++                ),
++            )
++        else:
++            add_code_change(
++                builder,
++                address,
++                CodeChange(
++                    block_access_index=idx,
++                    new_code=get_code(tx_state, post_code_hash),
++                ),
++            )
+ 
+     for address, slots in tx_state.storage_writes.items():
+         for key, post_value in slots.items():
+diff --git a/src/ethereum/forks/bogota/fork.py b/src/ethereum/forks/bogota/fork.py
+index f0a6018dffcb605767142dcc50791d648e263b6c..8778ac846d16821147a6258a255e6e9cf1c56a49 100644
+--- a/src/ethereum/forks/bogota/fork.py
++++ b/src/ethereum/forks/bogota/fork.py
+@@ -63,6 +63,15 @@ from .state_tracker import (
+     increment_nonce,
+     set_account_balance,
+ )
++from .system_contracts import (
++    BEACON_ROOTS_ADDRESS,
++    BUILDER_DEPOSIT_CONTRACT_ADDRESS,
++    BUILDER_EXIT_CONTRACT_ADDRESS,
++    CONSOLIDATION_REQUEST_PREDEPLOY_ADDRESS,
++    HISTORY_STORAGE_ADDRESS,
++    SYSTEM_ADDRESS,
++    WITHDRAWAL_REQUEST_PREDEPLOY_ADDRESS,
++)
+ from .transactions import (
+     BlobTransaction,
+     LegacyTransaction,
+@@ -80,7 +89,6 @@ from .transactions import (
+     validate_transaction,
+ )
+ from .utils.address import compute_contract_address
+-from .utils.hexadecimal import hex_to_address
+ from .vm.eoa_delegation import is_valid_delegation
+ from .vm.gas import MAX_BLOB_GAS_PER_BLOCK as MAX_BLOB_GAS_PER_BLOCK
+ from .vm.gas import (
+@@ -100,10 +108,6 @@ from .vm.interpreter import TransactionOutput, process_top_level
+ BASE_FEE_MAX_CHANGE_DENOMINATOR = Uint(8)
+ ELASTICITY_MULTIPLIER = Uint(2)
+ EMPTY_OMMER_HASH = keccak256(rlp.encode([]))
+-SYSTEM_ADDRESS = hex_to_address("0xfffffffffffffffffffffffffffffffffffffffe")
+-BEACON_ROOTS_ADDRESS = hex_to_address(
+-    "0x000F3df6D732807Ef1319fB7B8bB8522d0Beac02"
+-)
+ SYSTEM_TRANSACTION_GAS = ExecutionGas(Uint(30000000))
+ SYSTEM_MAX_SSTORES_PER_CALL = Uint(16)
+ """
+@@ -112,21 +116,6 @@ expected to write.
+ """
+ GWEI_TO_WEI = U256(10**9)
+ 
+-WITHDRAWAL_REQUEST_PREDEPLOY_ADDRESS = hex_to_address(
+-    "0x00000961Ef480Eb55e80D19ad83579A64c007002"
+-)
+-CONSOLIDATION_REQUEST_PREDEPLOY_ADDRESS = hex_to_address(
+-    "0x0000BBdDc7CE488642fb579F8B00f3a590007251"
+-)
+-BUILDER_DEPOSIT_CONTRACT_ADDRESS = hex_to_address(
+-    "0x0000BFF46984E3725691FA540A8C7589300D8282"
+-)
+-BUILDER_EXIT_CONTRACT_ADDRESS = hex_to_address(
+-    "0x000064D678505AD48F8CCB093BC65613800E8282"
+-)
+-HISTORY_STORAGE_ADDRESS = hex_to_address(
+-    "0x0000F90827F1C53a10cb7A02335B175320002935"
+-)
+ MAX_BLOCK_SIZE = 10_485_760
+ SAFETY_MARGIN = 2_097_152
+ MAX_RLP_BLOCK_SIZE = MAX_BLOCK_SIZE - SAFETY_MARGIN
+diff --git a/src/ethereum/forks/bogota/state_tracker.py b/src/ethereum/forks/bogota/state_tracker.py
+index 46395392f251e637d8ac3ee4b181cb01d45d0c7e..0099a1488a6ad020a4f622999db54b1e845930e8 100644
+--- a/src/ethereum/forks/bogota/state_tracker.py
++++ b/src/ethereum/forks/bogota/state_tracker.py
+@@ -81,6 +81,10 @@ class TransactionState:
+     ``storage_reads`` and ``account_reads`` are shared references
+     that survive rollback (reads from failed calls still appear in the
+     Block Access List).
++
++    ``accounts_with_adopted_code`` holds the accounts whose code hash was
++    last set by ``SETCODEFROM``, which the Block Access List records as a
++    hash rather than as bytecode.
+     """
+ 
+     parent: BlockState
+@@ -94,6 +98,7 @@ class TransactionState:
+     )
+     code_writes: Dict[Hash32, Bytes] = field(default_factory=dict)
+     created_accounts: Set[Address] = field(default_factory=set)
++    accounts_with_adopted_code: Set[Address] = field(default_factory=set)
+     storage_clears: Set[Address] = field(default_factory=set)
+     transient_storage: Dict[Tuple[Address, Bytes32], U256] = field(
+         default_factory=dict
+@@ -728,6 +733,27 @@ def set_code(
+     modify_state(tx_state, address, write_code_hash)
+ 
+ 
++def adopt_code(
++    tx_state: TransactionState, address: Address, code_hash: Hash32
++) -> None:
++    """
++    Point the account at `address` to existing code by its `code_hash`, as
++    [`SETCODEFROM`] does.
++
++    The bytecode is already stored, so only the code hash is written. The
++    account is remembered so that the Block Access List records the change
++    as the code hash instead of the bytecode.
++
++    [`SETCODEFROM`]: ref:ethereum.forks.bogota.vm.instructions.system.setcodefrom
++    """  # noqa: E501
++
++    def write_code_hash(account: Account) -> None:
++        account.code_hash = code_hash
++
++    modify_state(tx_state, address, write_code_hash)
++    tx_state.accounts_with_adopted_code.add(address)
++
++
+ # -- Snapshot / Rollback ---------------------------------------------------
+ 
+ 
+@@ -759,6 +785,7 @@ def copy_tx_state(tx_state: TransactionState) -> TransactionState:
+         },
+         code_writes=dict(tx_state.code_writes),
+         created_accounts=tx_state.created_accounts,
++        accounts_with_adopted_code=set(tx_state.accounts_with_adopted_code),
+         storage_clears=set(tx_state.storage_clears),
+         transient_storage=dict(tx_state.transient_storage),
+         storage_reads=tx_state.storage_reads,
+@@ -785,6 +812,7 @@ def restore_tx_state(
+     tx_state.code_writes = snapshot.code_writes
+     tx_state.storage_clears = snapshot.storage_clears
+     tx_state.transient_storage = snapshot.transient_storage
++    tx_state.accounts_with_adopted_code = snapshot.accounts_with_adopted_code
+ 
+ 
+ # -- Lifecycle --------------------------------------------------------------
+@@ -839,6 +867,7 @@ def incorporate_tx_into_block(
+     tx_state.storage_writes.clear()
+     tx_state.code_writes.clear()
+     tx_state.created_accounts.clear()
++    tx_state.accounts_with_adopted_code.clear()
+     tx_state.storage_clears.clear()
+     tx_state.transient_storage.clear()
+     tx_state.storage_reads = set()
+diff --git a/src/ethereum/forks/bogota/system_contracts.py b/src/ethereum/forks/bogota/system_contracts.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2ff1545046f7e62e60b80239557e7c7856f69f32
+--- /dev/null
++++ b/src/ethereum/forks/bogota/system_contracts.py
+@@ -0,0 +1,57 @@
++"""
++Contracts the protocol calls while processing a block.
++
++Before a block's transactions run, the protocol calls the beacon roots and
++block history contracts from [`SYSTEM_ADDRESS`] to record the parent beacon
++block root and the parent block hash. After them, it calls the request
++contracts to collect the requests queued during the block. Block processing
++depends on the code of these [`SYSTEM_CONTRACTS`], so their code cannot be
++replaced.
++
++[`SYSTEM_ADDRESS`]: ref:ethereum.forks.bogota.system_contracts.SYSTEM_ADDRESS
++[`SYSTEM_CONTRACTS`]: ref:ethereum.forks.bogota.system_contracts.SYSTEM_CONTRACTS
++"""  # noqa: E501
++
++from typing import FrozenSet
++
++from ethereum.state import Address
++
++from .utils.hexadecimal import hex_to_address
++
++SYSTEM_ADDRESS = hex_to_address("0xfffffffffffffffffffffffffffffffffffffffe")
++BEACON_ROOTS_ADDRESS = hex_to_address(
++    "0x000F3df6D732807Ef1319fB7B8bB8522d0Beac02"
++)
++WITHDRAWAL_REQUEST_PREDEPLOY_ADDRESS = hex_to_address(
++    "0x00000961Ef480Eb55e80D19ad83579A64c007002"
++)
++CONSOLIDATION_REQUEST_PREDEPLOY_ADDRESS = hex_to_address(
++    "0x0000BBdDc7CE488642fb579F8B00f3a590007251"
++)
++BUILDER_DEPOSIT_CONTRACT_ADDRESS = hex_to_address(
++    "0x0000BFF46984E3725691FA540A8C7589300D8282"
++)
++BUILDER_EXIT_CONTRACT_ADDRESS = hex_to_address(
++    "0x000064D678505AD48F8CCB093BC65613800E8282"
++)
++HISTORY_STORAGE_ADDRESS = hex_to_address(
++    "0x0000F90827F1C53a10cb7A02335B175320002935"
++)
++
++SYSTEM_CONTRACTS: FrozenSet[Address] = frozenset(
++    {
++        BEACON_ROOTS_ADDRESS,
++        HISTORY_STORAGE_ADDRESS,
++        WITHDRAWAL_REQUEST_PREDEPLOY_ADDRESS,
++        CONSOLIDATION_REQUEST_PREDEPLOY_ADDRESS,
++        BUILDER_DEPOSIT_CONTRACT_ADDRESS,
++        BUILDER_EXIT_CONTRACT_ADDRESS,
++    }
++)
++"""
++Accounts the protocol calls from [`SYSTEM_ADDRESS`] while processing a block.
++The deposit contract is not one of them: its logs are read, but it is never
++called.
++
++[`SYSTEM_ADDRESS`]: ref:ethereum.forks.bogota.system_contracts.SYSTEM_ADDRESS
++"""
+diff --git a/src/ethereum/forks/bogota/vm/exceptions.py b/src/ethereum/forks/bogota/vm/exceptions.py
+index 4bf3cee405511fb82dc426d3a0d22b78ee356977..1626517938e92624d2b6d3a9c1e87fc655833c3e 100644
+--- a/src/ethereum/forks/bogota/vm/exceptions.py
++++ b/src/ethereum/forks/bogota/vm/exceptions.py
+@@ -98,6 +98,14 @@ class WriteInStaticContext(ExceptionalHalt):
+     pass
+ 
+ 
++class CodeChangeInSystemContract(ExceptionalHalt):
++    """
++    Raised when an attempt is made to replace the code of a system contract.
++    """
++
++    pass
++
++
+ class OutOfBoundsRead(ExceptionalHalt):
+     """
+     Raised when an attempt was made to read data beyond the
+diff --git a/src/ethereum/forks/bogota/vm/instructions/__init__.py b/src/ethereum/forks/bogota/vm/instructions/__init__.py
+index 06295ec86f1ac24e6d82af5279e729c7276b8087..4b756412993546d5d02bfdc57505c2305af653a0 100644
+--- a/src/ethereum/forks/bogota/vm/instructions/__init__.py
++++ b/src/ethereum/forks/bogota/vm/instructions/__init__.py
+@@ -209,6 +209,7 @@ class Ops(enum.Enum):
+     LOG4 = 0xA4
+ 
+     # System Operations
++    SETCODEFROM = 0xA7
+     CREATE = 0xF0
+     CALL = 0xF1
+     CALLCODE = 0xF2
+@@ -374,4 +375,5 @@ op_implementation: Dict[Ops, Callable] = {
+     Ops.STATICCALL: system_instructions.staticcall,
+     Ops.REVERT: system_instructions.revert,
+     Ops.CREATE2: system_instructions.create2,
++    Ops.SETCODEFROM: system_instructions.setcodefrom,
+ }
+diff --git a/src/ethereum/forks/bogota/vm/instructions/system.py b/src/ethereum/forks/bogota/vm/instructions/system.py
+index 6bec5d2f0296790ada586e7fc8cefc94e3f681b0..7150ac04f65e7ec7b4f91429084c920f99390712 100644
+--- a/src/ethereum/forks/bogota/vm/instructions/system.py
++++ b/src/ethereum/forks/bogota/vm/instructions/system.py
+@@ -12,23 +12,27 @@ Implementations of the EVM system related instructions.
+ """
+ 
+ from dataclasses import dataclass
+-from typing import final
++from typing import Optional, final
+ 
+ from ethereum_types.bytes import Bytes
+ from ethereum_types.numeric import U256, Uint
+ 
+-from ethereum.state import Address
++from ethereum.crypto.hash import Hash32
++from ethereum.state import EMPTY_CODE_HASH, Address
+ from ethereum.utils.numeric import ceil32
+ 
+ from ...fork_types import ExecutionGas, StateGas
+ from ...state_tracker import (
+     account_deployable,
++    adopt_code,
+     get_account,
++    get_account_optional,
+     get_code,
+     increment_nonce,
+     is_account_alive,
+     move_ether,
+ )
++from ...system_contracts import SYSTEM_CONTRACTS
+ from ...utils.address import (
+     compute_contract_address,
+     compute_create2_contract_address,
+@@ -36,7 +40,12 @@ from ...utils.address import (
+ )
+ from ...vm.eoa_delegation import calculate_delegation_cost
+ from .. import CALL_SUCCESS, Evm, emit_transfer_log, incorporate_child
+-from ..exceptions import OutOfGasError, Revert, WriteInStaticContext
++from ..exceptions import (
++    CodeChangeInSystemContract,
++    OutOfGasError,
++    Revert,
++    WriteInStaticContext,
++)
+ from ..gas import (
+     GasCosts,
+     GasMeter,
+@@ -777,6 +786,74 @@ def selfdestruct(evm: Evm) -> None:
+     pass
+ 
+ 
++def setcodefrom(evm: Evm) -> None:
++    """
++    Replace the code of the current account with the code of another account.
++
++    The current account adopts the code hash of `source`, which must exist,
++    hold code that does not start with `0xEF`, and not have been created in
++    the current transaction. Otherwise nothing changes. `1` is pushed onto the
++    stack when `source` is valid and `0` when it is not.
++
++    The running frame keeps executing the code it loaded, while later calls to
++    the current account run the adopted code. The code of a system contract
++    can never be replaced.
++
++    See [EIP-8298].
++
++    [EIP-8298]: https://eips.ethereum.org/EIPS/eip-8298
++    """
++    if evm.is_static:
++        raise WriteInStaticContext
++    if evm.current_target in SYSTEM_CONTRACTS:
++        raise CodeChangeInSystemContract
++
++    # STACK
++    source = to_address_masked(pop(evm.stack))
++
++    # GAS (STATE-INDEPENDENT)
++    # Looking `source` up and inspecting its code is paid on every attempt,
++    # before `source` is accessed.
++    is_cold_access = source not in evm.accessed_addresses
++    if is_cold_access:
++        access_gas_cost = GasCosts.COLD_ACCOUNT_ACCESS
++    else:
++        access_gas_cost = GasCosts.WARM_ACCESS
++    access_gas_cost += GasCosts.WARM_ACCESS
++    charge_gas(evm, access_gas_cost)
++
++    # STATE ACCESS (STATE-DEPENDENT GAS)
++    # A valid `source` also pays to compare the current account's code hash
++    # with its own, and to write it when the two differ.
++    if is_cold_access:
++        evm.accessed_addresses.add(source)
++
++    tx_state = evm.tx_env.state
++    source_account = get_account_optional(tx_state, source)
++    success = U256(0)
++    new_code_hash: Optional[Hash32] = None
++    if (
++        source_account is not None
++        and source_account.code_hash != EMPTY_CODE_HASH
++        and get_code(tx_state, source_account.code_hash)[0] != 0xEF
++        and source not in tx_state.created_accounts
++    ):
++        success = U256(1)
++        charge_gas(evm, GasCosts.WARM_ACCESS)
++        current_account = get_account(tx_state, evm.current_target)
++        if current_account.code_hash != source_account.code_hash:
++            charge_gas(evm, GasCosts.ACCOUNT_WRITE)
++            new_code_hash = source_account.code_hash
++
++    # OPERATION
++    if new_code_hash is not None:
++        adopt_code(tx_state, evm.current_target, new_code_hash)
++    push(evm.stack, success)
++
++    # PROGRAM COUNTER
++    evm.pc += Uint(1)
++
++
+ def delegatecall(evm: Evm) -> None:
+     """
+     Message-call into an account.
+diff --git a/src/ethereum/forks/bogota/vm/interpreter.py b/src/ethereum/forks/bogota/vm/interpreter.py
+index 6eaefbba9cb4dc21b0c0bac3319d113eaaadcdd5..0d7679a0a1557c0943a54a11e40551bb5e209ee4 100644
+--- a/src/ethereum/forks/bogota/vm/interpreter.py
++++ b/src/ethereum/forks/bogota/vm/interpreter.py
+@@ -18,7 +18,7 @@ from ethereum_types.bytes import Bytes
+ from ethereum_types.numeric import U256, Uint, ulen
+ 
+ from ethereum.exceptions import EthereumException
+-from ethereum.state import EMPTY_ACCOUNT, Address
++from ethereum.state import EMPTY_ACCOUNT, EMPTY_CODE_HASH, Address
+ from ethereum.trace import (
+     EvmStop,
+     OpEnd,
+@@ -359,6 +359,11 @@ def process_create(evm: Evm) -> Evm:
+ 
+     evm = process_call(evm)
+     if not evm.error:
++        created_account = get_account(tx_state, evm.current_target)
++        if created_account.code_hash != EMPTY_CODE_HASH:
++            # Code adopted through `SETCODEFROM` stays; the returned bytes
++            # are neither validated nor deposited, and cost nothing.
++            return evm
+         contract_code = evm.output
+         try:
+             if len(contract_code) > 0:
+diff --git a/tests/bogota/__init__.py b/tests/bogota/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..42c034bbb4419ae57d1ce50c8141d0a3f48a3ba4
+--- /dev/null
++++ b/tests/bogota/__init__.py
+@@ -0,0 +1,4 @@
++"""
++Test cases for EVM functionality introduced in Bogota, [EIP-8081: Hardfork
++Meta - Hegotá](https://eips.ethereum.org/EIPS/eip-8081).
++"""
+diff --git a/tests/bogota/eip8298_setcodefrom/__init__.py b/tests/bogota/eip8298_setcodefrom/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2bfc12f418a0b23535b0c43e0a4c99cbee2dc345
+--- /dev/null
++++ b/tests/bogota/eip8298_setcodefrom/__init__.py
+@@ -0,0 +1,4 @@
++"""
++Tests for [EIP-8298: SETCODEFROM Code Reuse
++Instruction](https://eips.ethereum.org/EIPS/eip-8298).
++"""
+diff --git a/tests/bogota/eip8298_setcodefrom/helpers.py b/tests/bogota/eip8298_setcodefrom/helpers.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d2145f9b1068665a04ff85e48015126d25a28bf5
+--- /dev/null
++++ b/tests/bogota/eip8298_setcodefrom/helpers.py
+@@ -0,0 +1,78 @@
++"""Shared scenario code for the EIP-8298 `SETCODEFROM` tests."""
++
++from typing import Any
++
++from execution_testing import Address, BalCodeChange, Bytecode, Hash, Op
++
++RESULT_SLOT = 0
++MARKER_SLOT = 0x7E
++MARKER_A = 0x7E3A
++MARKER_B = 0x7E3B
++MARKER_C = 0x7E3C
++SENTINEL = 0xDEAD  # pre-set so an expected 0 proves a write
++
++SSTORE_MARKER_A = Op.SSTORE(MARKER_SLOT, MARKER_A) + Op.STOP
++SSTORE_MARKER_B = Op.SSTORE(MARKER_SLOT, MARKER_B) + Op.STOP
++# Adopt the source in the first calldata word and store the result.
++ADOPT_FROM_CALLDATA = (
++    Op.SSTORE(RESULT_SLOT, Op.SETCODEFROM(Op.CALLDATALOAD(0))) + Op.STOP
++)
++# Like ADOPT_FROM_CALLDATA, with a marker first so its bytes differ.
++SSTORE_MARKER_C_THEN_ADOPT = (
++    Op.SSTORE(MARKER_SLOT, MARKER_C) + ADOPT_FROM_CALLDATA
++)
++# Revert with the current account's code hash as the revert data.
++REVERT_WITH_CODE_HASH = Op.MSTORE(0, Op.EXTCODEHASH(Op.ADDRESS)) + Op.REVERT(
++    0, 32
++)
++
++
++def adopt_code(**metadata: bool) -> Bytecode:
++    """Return code that adopts the source in the first calldata word."""
++    return Op.SETCODEFROM(Op.CALLDATALOAD(0), **metadata) + Op.STOP
++
++
++def multi_code(**metadata: bool) -> Bytecode:
++    """Return code that adopts the sources in calldata words 0 to 2."""
++    adoptions = sum(
++        (
++            Op.POP(Op.SETCODEFROM(Op.CALLDATALOAD(offset), **metadata))
++            for offset in (0, 32, 64)
++        ),
++        Bytecode(),
++    )
++    return adoptions + Op.STOP
++
++
++def word(address: Address) -> Hash:
++    """Return `address` as a 32-byte calldata word."""
++    return Hash(address, left_padding=True)
++
++
++def call_with(
++    target: Address | Bytecode,
++    call_arg: Address | Bytecode | None = None,
++    *,
++    call_opcode: Op = Op.CALL,
++    **kwargs: Any,
++) -> Bytecode:
++    """
++    Call `target` with `call_arg` as its only calldata word, written to
++    memory 0, leaving the call result on the stack.
++    """
++    if call_arg is None:
++        return call_opcode(address=target, **kwargs)
++    return Op.MSTORE(0, call_arg) + call_opcode(
++        address=target, args_size=32, **kwargs
++    )
++
++
++def adoption(index: int, code: Bytecode) -> list[BalCodeChange]:
++    """Return the BAL code change that records adopting `code`."""
++    return [
++        BalCodeChange(
++            block_access_index=index,
++            new_code=b"",
++            new_code_hash=code.keccak256(),
++        )
++    ]
+diff --git a/tests/bogota/eip8298_setcodefrom/spec.py b/tests/bogota/eip8298_setcodefrom/spec.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1f5b08354cc25b07fedf39b6f1fc76dc66a1672b
+--- /dev/null
++++ b/tests/bogota/eip8298_setcodefrom/spec.py
+@@ -0,0 +1,17 @@
++"""Reference spec for [EIP-8298: SETCODEFROM Code Reuse Instruction](https://eips.ethereum.org/EIPS/eip-8298)."""
++
++from dataclasses import dataclass
++
++
++@dataclass(frozen=True)
++class ReferenceSpec:
++    """Reference specification."""
++
++    git_path: str
++    version: str
++
++
++ref_spec_8298 = ReferenceSpec(
++    git_path="EIPS/eip-8298.md",
++    version="7608d692a07937802ebef079c87e3853e1278dc5",
++)

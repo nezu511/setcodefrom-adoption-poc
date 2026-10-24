@@ -1,0 +1,295 @@
+diff --git a/packages/testing/src/execution_testing/forks/base_fork.py b/packages/testing/src/execution_testing/forks/base_fork.py
+index a6feb3644d4dd4bc502222c22e1bf426a8dfaf93..0b52c84db27f538b943641e4b172b33ecb1e7361 100644
+--- a/packages/testing/src/execution_testing/forks/base_fork.py
++++ b/packages/testing/src/execution_testing/forks/base_fork.py
+@@ -1118,6 +1118,17 @@ class BaseFork(ForkOpcodeInterface, metaclass=BaseForkMeta):
+         """Return list of precompiles supported by the fork."""
+         pass
+ 
++    @classmethod
++    @abstractmethod
++    def ecrecover_gas(cls, *, recovered: bool, address_warm: bool) -> int:
++        """
++        Return the gas charged by the ecrecover precompile.
++
++        `recovered` tells whether the input yields a signer address, and
++        `address_warm` whether that address was already accessed.
++        """
++        pass
++
+     @classmethod
+     @abstractmethod
+     def system_contracts(cls) -> List[Address]:
+diff --git a/packages/testing/src/execution_testing/forks/forks/eips/bogota/eip_8151.py b/packages/testing/src/execution_testing/forks/forks/eips/bogota/eip_8151.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..80ea7275d87291b9a1708191764ed4bbce33f685
+--- /dev/null
++++ b/packages/testing/src/execution_testing/forks/forks/eips/bogota/eip_8151.py
+@@ -0,0 +1,34 @@
++"""
++EIP-8151: Account Code Restricted ecRecover.
++
++The ecrecover precompile reads the recovered account and withholds the
++address when the account holds code other than a delegation designation.
++Reading the account is priced as an account access plus a code read.
++
++https://eips.ethereum.org/EIPS/eip-8151
++"""
++
++from ....base_fork import BaseFork
++
++
++class EIP8151(BaseFork):
++    """EIP-8151 class."""
++
++    @classmethod
++    def ecrecover_gas(cls, *, recovered: bool, address_warm: bool) -> int:
++        """
++        A recovered address is charged a warm or cold account access and a
++        code read on top of the base fee; a failed recovery reads no account.
++        """
++        base_gas = super(EIP8151, cls).ecrecover_gas(
++            recovered=recovered, address_warm=address_warm
++        )
++        if not recovered:
++            return base_gas
++        gas_costs = cls.gas_costs()
++        if address_warm:
++            access_gas = gas_costs.WARM_ACCESS
++        else:
++            access_gas = gas_costs.COLD_ACCOUNT_ACCESS
++        code_read_gas = gas_costs.WARM_ACCESS
++        return base_gas + access_gas + code_read_gas
+diff --git a/packages/testing/src/execution_testing/forks/forks/forks.py b/packages/testing/src/execution_testing/forks/forks/forks.py
+index b400c810c836b19705114c39b79413f77ba70c5c..d51d0678c27b7c5e43834c39d68b9a7f4a35ecd0 100644
+--- a/packages/testing/src/execution_testing/forks/forks/forks.py
++++ b/packages/testing/src/execution_testing/forks/forks/forks.py
+@@ -1081,6 +1081,12 @@ class Frontier(BaseFork):
+             Address(4, label="ID"),
+         ]
+ 
++    @classmethod
++    def ecrecover_gas(cls, *, recovered: bool, address_warm: bool) -> int:
++        """At Genesis, ecrecover charges a flat fee for every input."""
++        del recovered, address_warm
++        return cls.gas_costs().PRECOMPILE_ECRECOVER
++
+     @classmethod
+     def system_contracts(cls) -> List[Address]:
+         """At Genesis, no system contracts are present."""
+diff --git a/packages/testing/src/execution_testing/forks/tests/test_forks.py b/packages/testing/src/execution_testing/forks/tests/test_forks.py
+index 4f37d0e4a121097c4412a85948ac3da2b41d3531..140e63e3e0bdba73fb16b55c20c1a2383efdda91 100644
+--- a/packages/testing/src/execution_testing/forks/tests/test_forks.py
++++ b/packages/testing/src/execution_testing/forks/tests/test_forks.py
+@@ -405,6 +405,43 @@ def test_precompiles() -> None:  # noqa: D103
+     assert sorted(Cancun.precompiles()) == list(range(1, 11))
+ 
+ 
++@pytest.mark.parametrize(
++    "fork,recovered,address_warm,expected_gas",
++    [
++        pytest.param(Frontier, True, False, 3_000, id="Frontier-recovered"),
++        pytest.param(Amsterdam, False, False, 3_000, id="Amsterdam-failed"),
++        pytest.param(Amsterdam, True, False, 3_000, id="Amsterdam-cold"),
++        pytest.param(Amsterdam, True, True, 3_000, id="Amsterdam-warm"),
++        pytest.param(Bogota, False, False, 3_000, id="Bogota-failed"),
++        pytest.param(Bogota, False, True, 3_000, id="Bogota-failed-warm"),
++        pytest.param(Bogota, True, False, 6_100, id="Bogota-cold"),
++        pytest.param(Bogota, True, True, 3_200, id="Bogota-warm"),
++    ],
++)
++def test_ecrecover_gas(
++    fork: Fork, recovered: bool, address_warm: bool, expected_gas: int
++) -> None:
++    """
++    Test that only a recovered address adds an account access and a code
++    read to the ecrecover fee, and only once the restriction is enabled.
++    """
++    assert (
++        fork.ecrecover_gas(recovered=recovered, address_warm=address_warm)
++        == expected_gas
++    )
++
++
++def test_ecrecover_gas_at_transition() -> None:
++    """Test that the ecrecover gas switches at the transition."""
++    fork = AmsterdamToBogotaAtTime15k
++    before = fork.fork_at(timestamp=14_999)
++    after = fork.fork_at(timestamp=15_000)
++    assert not before.is_eip_enabled(8151)
++    assert after.is_eip_enabled(8151)
++    assert before.ecrecover_gas(recovered=True, address_warm=False) == 3_000
++    assert after.ecrecover_gas(recovered=True, address_warm=False) == 6_100
++
++
+ @pytest.mark.parametrize("fork", sorted(ALL_FORKS, key=str), ids=str)
+ def test_system_contract_request_types(fork: Fork) -> None:
+     """
+diff --git a/packages/testing/src/execution_testing/test_types/account_types.py b/packages/testing/src/execution_testing/test_types/account_types.py
+index b80664f78bc74fed00b3b43d7fb6213c8e30c7f1..ba6eae15830dcd0ed62c2ad7fcf72890d7af668b 100644
+--- a/packages/testing/src/execution_testing/test_types/account_types.py
++++ b/packages/testing/src/execution_testing/test_types/account_types.py
+@@ -122,6 +122,22 @@ class EOA(Address):
+         """Return copy of the EOA."""
+         return self.__class__(Address(self), key=self.key, nonce=self.nonce)
+ 
++    def sign_digest(
++        self, digest: FixedSizeBytesConvertible
++    ) -> Tuple[int, int, int]:
++        """
++        Sign a 32-byte digest as is, without hashing it again, and return
++        the `(v, r, s)` that the ecrecover precompile takes, with `v` being
++        the recovery id plus 27.
++        """
++        if self.key is None:
++            raise ValueError("cannot sign a digest without a private key")
++        signature = PrivateKey(self.key).sign_recoverable(Hash(digest))
++        v = signature[64] + 27
++        r = int.from_bytes(signature[0:32], byteorder="big")
++        s = int.from_bytes(signature[32:64], byteorder="big")
++        return v, r, s
++
+ 
+ class AllocGroupHash(FixedSizeBytes[8]):  # type: ignore
+     """Class that helps represent hashes used to group allocs."""
+diff --git a/packages/testing/src/execution_testing/test_types/tests/test_account_types.py b/packages/testing/src/execution_testing/test_types/tests/test_account_types.py
+index cfce942ccc8e0a2d9163b8178e63b5f4837b6e6e..8c01036f32e7a227bf4446d39abcc7d9382e44f2 100644
+--- a/packages/testing/src/execution_testing/test_types/tests/test_account_types.py
++++ b/packages/testing/src/execution_testing/test_types/tests/test_account_types.py
+@@ -4,12 +4,19 @@ from typing import Callable
+ 
+ import ethereum.state as spec_state
+ import pytest
++from ethereum.crypto.elliptic_curve import SECP256K1N, secp256k1_recover
++from ethereum.crypto.hash import Hash32, keccak256
+ from ethereum_types.bytes import Bytes20, Bytes32
+ from ethereum_types.numeric import U256, Uint
+ 
+-from execution_testing.base_types import Address, StateCommitment, Storage
++from execution_testing.base_types import (
++    Address,
++    StateCommitment,
++    Storage,
++    TestPrivateKey,
++)
+ 
+-from ..account_types import Account, Alloc
++from ..account_types import EOA, Account, Alloc
+ 
+ STORAGE_WRITES: dict[str, Callable[[Storage], object]] = {
+     "setitem": lambda storage: storage.__setitem__(1, 2),
+@@ -173,3 +180,47 @@ def test_apply_diff_storages_are_frozen() -> None:
+     assert alloc[changed] == Account(storage={0: 1, 1: 2})
+     assert alloc[cleared] == Account()
+     assert alloc[zeroed] == Account(storage={1: 1})
++
++
++@pytest.mark.parametrize(
++    "digest",
++    [
++        pytest.param(b"\x00" * 32, id="zero"),
++        pytest.param(keccak256(b"ecrecover"), id="keccak"),
++        pytest.param(b"\xff" * 32, id="max"),
++    ],
++)
++def test_eoa_sign_digest_recovers_signer(digest: bytes) -> None:
++    """
++    Test that the spec's recovery maps a digest signature back to the
++    signer, with a low `s` and `v` in the form ecrecover takes.
++    """
++    eoa = EOA(key=TestPrivateKey)
++    v, r, s = eoa.sign_digest(digest)
++    assert v in (27, 28)
++    assert 0 < s <= int(SECP256K1N) // 2
++    public_key = secp256k1_recover(
++        U256(r), U256(s), U256(v - 27), Hash32(digest)
++    )
++    assert Address(keccak256(public_key)[12:32]) == eoa
++
++
++def test_eoa_sign_digest_requires_key() -> None:
++    """Test that an EOA known only by its address cannot sign."""
++    eoa = EOA(Address(0x1234))
++    with pytest.raises(ValueError, match="private key"):
++        eoa.sign_digest(b"\x00" * 32)
++
++
++@pytest.mark.parametrize(
++    "digest",
++    [
++        pytest.param(b"\x01" * 31, id="short"),
++        pytest.param(b"\x01" * 33, id="long"),
++    ],
++)
++def test_eoa_sign_digest_requires_32_bytes(digest: bytes) -> None:
++    """Test that a digest of any other length is rejected, not padded."""
++    eoa = EOA(key=TestPrivateKey)
++    with pytest.raises(ValueError, match="fixed size bytes"):
++        eoa.sign_digest(digest)
+diff --git a/src/ethereum/forks/bogota/vm/precompiled_contracts/ecrecover.py b/src/ethereum/forks/bogota/vm/precompiled_contracts/ecrecover.py
+index 07eab99e3196167a3003e50e0495a8576a159e5d..f8087113e851dac70f6fd3fd7d9c86b7ed3e4710 100644
+--- a/src/ethereum/forks/bogota/vm/precompiled_contracts/ecrecover.py
++++ b/src/ethereum/forks/bogota/vm/precompiled_contracts/ecrecover.py
+@@ -16,23 +16,26 @@ from ethereum_types.numeric import U256
+ from ethereum.crypto.elliptic_curve import SECP256K1N, secp256k1_recover
+ from ethereum.crypto.hash import Hash32, keccak256
+ from ethereum.exceptions import InvalidSignatureError
++from ethereum.state import Address
+ from ethereum.utils.byte import left_pad_zero_bytes
+ 
++from ...state_tracker import get_account, get_code
+ from ...vm import Evm
++from ...vm.eoa_delegation import is_valid_delegation
+ from ...vm.gas import GasCosts, charge_gas
+ from ...vm.memory import buffer_read
+ 
+ 
+ def ecrecover(evm: Evm) -> None:
+     """
+-    Decrypts the address using elliptic curve DSA recovery mechanism and writes
+-    the address to output.
+-
+-    Parameters
+-    ----------
+-    evm :
+-        The current EVM frame.
++    Recover the address that signed a message hash and write it, left-padded
++    to a word, to the output.
+ 
++    A successful recovery pays for accessing the recovered account and for
++    reading its code, and warms the account. Leave the output empty if
++    recovery fails or if the account holds code other than a delegation
++    designation; protocol rules already bar such an account from sending
++    transactions with its original key.
+     """
+     data = evm.call_data
+ 
+@@ -59,6 +62,25 @@ def ecrecover(evm: Evm) -> None:
+         # unable to extract public key
+         return
+ 
+-    address = keccak256(public_key)[12:32]
+-    padded_address = left_pad_zero_bytes(address, 32)
+-    evm.output = padded_address
++    address = Address(keccak256(public_key)[12:32])
++
++    # GAS (STATE-INDEPENDENT)
++    is_cold_access = address not in evm.accessed_addresses
++    if is_cold_access:
++        access_gas_cost = GasCosts.COLD_ACCOUNT_ACCESS
++    else:
++        access_gas_cost = GasCosts.WARM_ACCESS
++    access_gas_cost += GasCosts.WARM_ACCESS  # Code reading cost
++    charge_gas(evm, access_gas_cost)
++
++    # STATE ACCESS (STATE-DEPENDENT GAS)
++    if is_cold_access:
++        evm.accessed_addresses.add(address)
++    tx_state = evm.tx_env.state
++    code = get_code(tx_state, get_account(tx_state, address).code_hash)
++
++    # OPERATION
++    if code and not is_valid_delegation(code):
++        return
++
++    evm.output = left_pad_zero_bytes(address, 32)
