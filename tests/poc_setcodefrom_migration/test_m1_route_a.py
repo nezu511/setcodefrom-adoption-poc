@@ -74,6 +74,7 @@ from .contracts import (
     recorder_code,
     verifier_code,
 )
+from .harness import bad_example_permissive_fallback_code
 from .helpers import (
     MIGRATION_TUPLE,
     SCOPE_EXECUTION,
@@ -640,6 +641,10 @@ REJECTIONS = {
     "init_data_swapped": Rejection("InitDataMismatch"),
     # 10: the registration proof is not the key's, so initialize reverts.
     "bad_registration_proof": Rejection("InitializeFailed"),
+    # 11: initialize "succeeds" because the code's fallback accepts every
+    # selector, but nothing ran and R4's record is empty (a v2.8 candidate:
+    # v2.7's P3 only looks at whether the call reverted).
+    "initialize_not_recorded": Rejection("NotInitialized"),
 }
 
 
@@ -685,6 +690,13 @@ def test_route_a_rejected(
     sent_init = signed_init
     if case == "code_hash_mismatch":
         p = replace(p, code_hash=code_hash(Op.STOP))
+    elif case == "initialize_not_recorded":
+        permissive = bad_example_permissive_fallback_code()
+        p = replace(
+            p,
+            source=pre.deploy_contract(permissive),
+            code_hash=code_hash(permissive),
+        )
     elif case == "init_data_swapped":
         sent_init = registration(owner, deployment.verifier, OTHER_KEY)
     elif case == "bad_registration_proof":

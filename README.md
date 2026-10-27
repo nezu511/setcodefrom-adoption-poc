@@ -5,7 +5,8 @@ This repository is a proof of concept (PoC) for the pre-ERC
 SETCODEFROM"**, draft v2.7: posts #1 and #2 of
 <https://ethereum-magicians.org/t/30020> as revised on 2026-10-23. Later
 revisions of those posts are not covered; v2.7 stays in their edit
-history.
+history. One exception, a v2.8 candidate: `Migrator` also reads R4's
+record after `initialize` (see [Spec claims and PoC choices](#spec-claims-and-poc-choices)).
 
 It runs the draft's migration guard (`MigrationCheck`) and Route A
 (EIP-7702 + `Migrator`) on the Python execution specs (EELS,
@@ -40,8 +41,9 @@ requirements on adopted code, and P1–P4 the four checks of
 `ownerSig` is the old key's signature over `D`. In Route A, one type-4
 transaction delegates the EOA to `Migrator` and calls its `migrate`, which
 calls `MigrationCheck.begin` (P1), adopts the signed code with
-`SETCODEFROM`, runs its `initialize` (P3), and calls `MigrationCheck.finish`
-(P2, P4), which emits `Migrated`.
+`SETCODEFROM`, runs its `initialize` (P3, then the check of R4's record
+described below), and calls `MigrationCheck.finish` (P2, P4), which emits
+`Migrated`.
 
 ## The four results
 
@@ -67,7 +69,7 @@ FM2 and FM7 are out of scope (see [Known limits](#known-limits)).
 | Draft | Tests | What they show |
 |---|---|---|
 | FM1. Self-recovery locks the account out | `test_fm1_*` (3 tests) | Result 3 above. |
-| FM3. Adopted but not initialized | `test_fm3_adopted_not_initialized`, `test_fm3_adopted_not_initialized_cannot_send` | Kernel adopted without `initialize`: the new key's valid signature gives `0xffffffff`; `initialize` from outside reverts with `NotSelf`; a 7702 authorization signed by the account is skipped (nonce and code unchanged); a transaction from the old key is rejected (`SENDER_NOT_EOA`, EIP-3607). |
+| FM3. Adopted but not initialized | `test_fm3_adopted_not_initialized`, `test_fm3_adopted_not_initialized_cannot_send`, `test_route_a_rejected[initialize_not_recorded]` | Kernel adopted without `initialize`: the new key's valid signature gives `0xffffffff`; `initialize` from outside reverts with `NotSelf`; a 7702 authorization signed by the account is skipped (nonce and code unchanged); a transaction from the old key is rejected (`SENDER_NOT_EOA`, EIP-3607). Through `Migrator`, code whose fallback accepts every selector makes the `initialize` call succeed with nothing initialized; `Migrator` refuses it with `NotInitialized` (a v2.8 candidate, see below). |
 | FM4. Receiving breaks | `test_fm4_receive_with_migrator_delegation_left`, `test_fm4_kernel_receives_on_stipend`, `test_fm4_code_without_receive_path` | Result 4; the kernel receives on the stipend alone (wt-both); code without a receive path makes the transfer and the three hooks fail. |
 | FM4. "Senders that hard-code 21,000 gas can fail against almost any code, a 7702 delegation included" | `test_fm4_plain_transfer_with_21000_gas[eoa/migrator_delegated/kernel_adopted]` | A 1 wei transfer with a 21,000 gas limit: status 1 to an EOA without code, status 0 to an account delegated to `Migrator` (the 7702 delegation case, observed directly) and to an account with the kernel. The whole 21,000 is used. See the note on gas in [Known limits](#known-limits). |
 | FM5. The source can change | `test_fm5_source_replaced_after_signing` | The source replaces its own code after the owner signed its hash: `SourceHashMismatch`. |
@@ -75,7 +77,7 @@ FM2 and FM7 are out of scope (see [Known limits](#known-limits)).
 
 ### Guard checks and errors
 
-All 21 custom errors of the PoC contracts are asserted by selector in at
+All 22 custom errors of the PoC contracts are asserted by selector in at
 least one test. Tests marked "(PoC choice)" pin a choice that v2.7 leaves
 open; see [Spec claims and PoC choices](#spec-claims-and-poc-choices).
 
@@ -84,7 +86,7 @@ open; see [Spec claims and PoC choices](#spec-claims-and-poc-choices).
 | P1: `ecrecover(D, ownerSig)` succeeds and returns the account | `MigrationCheck.begin`, `P1Failed` | `test_route_a_rejected[broken_owner_signature/other_signer_with_code]`, `test_fm6_p1_refuses_other_signer_without_code`, `test_fm6_p1_p4_against_fake_ecrecover[p1_reverts_with_owner]` |
 | P1 while delegated (EIP-8151 exempts delegation indicators) | — | `test_p1_while_delegated` |
 | P2: `EXTCODEHASH(account) == codeHash` after adoption | `finish`, `P2Failed` | `test_fm5_adopted_code_replaces_itself` (the adopted code replaces itself in `initialize`) |
-| P3: `initialize(initData)` ran and `keccak256(initData) == initDataHash` (Route A: `Migrator`) | `Migrator`, `InitDataMismatch`, `InitializeFailed` | `test_route_a_rejected[init_data_swapped/bad_registration_proof]`, `test_kernel_initialize_rejected` |
+| P3: `initialize(initData)` ran and `keccak256(initData) == initDataHash` (Route A: `Migrator`) | `Migrator`, `InitDataMismatch`, `InitializeFailed`, `NotInitialized` (PoC choice, a v2.8 candidate) | `test_route_a_rejected[init_data_swapped/bad_registration_proof/initialize_not_recorded]`, `test_kernel_initialize_rejected` |
 | P4: the same call, with the `ownerSig` P1 accepted, succeeds with empty output | `finish`, `P4Failed`, `NotBegun` | Result 2; `test_fm6_p1_p4_against_fake_ecrecover[empty_output/p4_call_reverts/zero_word]`; `test_begin_finish_link[other_signature]` |
 | `begin` tells the routes apart | `UnsupportedRoute` | `test_begin_unsupported_route_other_delegate`, `test_begin_unsupported_route_eoa_without_code` (Route A only; see [Known limits](#known-limits)) |
 | `begin`: `p.check == address(this)`, deadline (valid while `block.timestamp <= deadline`), revocation | `WrongCheck`, `Expired`, `Revoked` | `test_begin_wrong_check`, `test_begin_deadline[at_deadline/expired]`, `test_begin_revoked` |
@@ -132,6 +134,20 @@ choice.
 |---|---|
 | `ownerSig` must be 65 bytes. | `test_bad_signature_length` |
 | The layout of `initData`, and `BadInitData` for malformed words. v2.7 says the layout "is implementation-defined in this draft". | `test_kernel_initialize_rejected[verifier_high_bits/scope_over_8_bits]` |
+| **A check beyond v2.7 (a v2.8 candidate).** After the `initialize` call, `Migrator` requires `SLOAD(INITIALIZED_CODE_HASH_SLOT) == EXTCODEHASH(this)` and otherwise reverts with `NotInitialized`. v2.7's pseudo-code (`require address(this).call(initialize(initData))`) and `finish` (P2, P4) do not read R4's record. Without this check, code whose fallback accepts every selector, such as a Safe with no fallback handler set, passes P1–P4 with nothing initialized: the `initialize` call succeeds and does nothing. | `test_route_a_rejected[initialize_not_recorded]` (test-only code from `harness.py`: `bad_example_permissive_fallback_code`) |
+
+With the check removed from `Migrator`, `test_route_a_rejected[initialize_not_recorded]`
+fails: the migration completes and `Migrated` is emitted (checked on
+`wt-both`).
+
+Because of the check, the test-only adopted code that must get through
+Route A writes R4's record in its `initialize`, as the kernel does
+(`record_initialization` in `harness.py`): the self-recovering wallet, the
+code whose `initialize` calls `finish`, and the source that replaces the
+account's code (its record names the replacement, so `Migrator`'s check
+passes and `finish` stops it at P2). The expected storage of
+`test_fm1_guard_passes_self_recovery` and of the control case of
+`test_adopted_initialize_calls_finish` therefore holds the record.
 
 `test_adopted_initialize_calls_finish` uses test-only adopted code whose
 `initialize` calls `MigrationCheck.finish(p, ownerSig)` itself and ignores
@@ -139,8 +155,8 @@ the result. With EIP-8151, `Migrator`'s own `finish` then reverts with
 `NotBegun` and the whole migration reverts, as v2.7's "Linking `begin` and
 `finish`" describes. Without EIP-8151, `Migrator`'s `finish` reverts with
 `P4Failed`, as in the control; the test does not observe what the inner
-call did. In a control case, `initialize` does nothing and the migration
-completes with one `Migrated`.
+call did. In a control case, `initialize` only writes R4's record and the
+migration completes with one `Migrated`.
 
 ## Known limits
 
@@ -162,6 +178,23 @@ completes with one `Migrated`.
   slot the kernel reads. `test_is_valid_signature_scope` and the control
   account in `test_prior_working_authority_void_after_migration` rely on
   this behavior.
+- **The check of R4's record is not a quality check.** Code that writes
+  `INITIALIZED_CODE_HASH_SLOT` and installs nothing passes it (the
+  self-recovering wallet does). It stops code that never ran an
+  initialization, not code that pretends to. It does not replace choosing
+  a code hash that has been checked against the profile ("Inputs, not
+  quality").
+- **A stale record is not handled (not tested).** If the account's storage
+  already holds the new code's hash at `INITIALIZED_CODE_HASH_SLOT` (left
+  by an earlier delegate), conforming code reverts in `initialize` (R4),
+  but code with a permissive fallback would satisfy the check without
+  running anything. Reading the slot before `SETCODEFROM` and requiring
+  that it differs from `p.codeHash` would close this; this PoC does not.
+- **Route B is not covered by the check.** Its `finish` is a different
+  contract and cannot read the account's storage, and frames do not pass
+  return data to later frames, so it would need a getter on the account.
+  That would add a second interface to the profile, so it is an open
+  question, not part of this PoC.
 - **No replacement path, so R6 is not tested.** The kernel has no entry
   that replaces its code; `test_contract_opcodes` checks that its bytecode
   has no `SETCODEFROM` opcode. It also has no entry for authority changes
@@ -303,8 +336,8 @@ new work directory.
 
 | Tree | passed | failed | skipped |
 |---|---|---|---|
-| `wt-both` | 242 | 0 | 0 |
-| `wt-8298` | 234 | 0 | 8 |
+| `wt-both` | 246 | 0 | 0 |
+| `wt-8298` | 238 | 0 | 8 |
 
 The same counts are expected on both paths. The 8 tests skipped in `wt-8298` are the
 ones that only make sense once the migration completes:
@@ -322,12 +355,12 @@ logs the gas of each transaction. `scripts/run.sh --gas` runs it on
 
 | Transaction | Tree | Execution gas | State gas | Paid by sender |
 |---|---|---|---|---|
-| Create `Migrator` (703 bytes) | both | 69,696 (calldata floor) | 1,259,190 | 1,292,986 |
+| Create `Migrator` (758 bytes) | both | 73,216 (calldata floor) | 1,343,340 | 1,378,033 |
 | Create `MigrationCheck` (1,177 bytes) | both | 100,032 (calldata floor) | 1,984,410 | 2,026,518 |
-| Migration, sponsored | wt-both | 156,357 | 622,710 | 779,067 |
-| Migration, self-sent | wt-both | 144,357 | 622,710 | 767,067 |
-| Migration, sponsored, reverts at P4 | wt-8298 | 153,941 | 35,190 | 189,131 |
-| Migration, self-sent, reverts at P4 | wt-8298 | 141,941 | 35,190 | 177,131 |
+| Migration, sponsored | wt-both | 156,579 | 622,710 | 779,289 |
+| Migration, self-sent | wt-both | 144,579 | 622,710 | 767,289 |
+| Migration, sponsored, reverts at P4 | wt-8298 | 154,163 | 35,190 | 189,353 |
+| Migration, self-sent, reverts at P4 | wt-8298 | 142,163 | 35,190 | 177,353 |
 
 "Paid by sender" is not always execution + state: for the two creations
 the execution column shows the calldata floor, which in this table
@@ -339,9 +372,9 @@ The state gas matches these formulas with `COST_PER_STATE_BYTE = 1530`:
 |---|---|
 | 622,710 | (6 × 64 + 23) × 1,530, where 6 is the number of new storage slots and 23 the length of the delegation indicator |
 | 35,190 | 23 × 1,530 (the delegation stays even though the call reverts) |
-| 1,259,190 | (703 + 120) × 1,530 |
+| 1,343,340 | (758 + 120) × 1,530 |
 | 1,984,410 | (1,177 + 120) × 1,530 |
-| 3,243,600 | 1,259,190 + 1,984,410, the `gasUsed` of the block that creates both contracts (a block's `gasUsed` is the larger of its execution and state totals) |
+| 3,327,750 | 1,343,340 + 1,984,410, the `gasUsed` of the block that creates both contracts (a block's `gasUsed` is the larger of its execution and state totals) |
 
 ## Layout
 

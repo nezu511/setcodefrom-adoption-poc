@@ -37,6 +37,7 @@ from .contracts import (
     ECRECOVER,
     ERC1271_MAGIC,
     FINISH,
+    INITIALIZED_CODE_HASH_SLOT,
     INVALID,
     code_hash,
 )
@@ -298,8 +299,13 @@ def test_adopted_initialize_calls_finish(
       reverts with `P4Failed`, as in the control. This test does not
       observe the inner `finish` (by the code it reverts at P4, which
       rolls back its clearing of the mark).
-    - `control`: `initialize` only succeeds. With EIP-8151 the migration
-      completes with one `Migrated`; without it, `P4Failed`.
+    - `control`: `initialize` only writes R4's record and succeeds. With
+      EIP-8151 the migration completes with one `Migrated`; without it,
+      `P4Failed`.
+
+    In both cases the test code's `initialize` writes R4's record first,
+    so Migrator's check of the record (`NotInitialized`) passes and it is
+    `finish` that decides.
 
     `initData` holds the address of a holder deployed in block 2, whose
     code is the calldata of `finish(p, ownerSig)`.
@@ -355,7 +361,16 @@ def test_adopted_initialize_calls_finish(
         ],
     )
     if reason is None:
-        owner_post = Account(code=source_code, nonce=1, storage={})
+        # R4's record, written by the test code's `initialize`.
+        owner_post = Account(
+            code=source_code,
+            nonce=1,
+            storage={
+                INITIALIZED_CODE_HASH_SLOT: int.from_bytes(
+                    code_hash(source_code)
+                )
+            },
+        )
     else:
         owner_post = delegated_to(deployment.migrator, nonce=1)
     post: Dict = {

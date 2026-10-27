@@ -7,6 +7,11 @@ calls `finish`, used only to reproduce the failure modes and to reach the
 guard's checks. The reference contracts
 (verifier, kernel, MigrationCheck, Migrator) and the `Recorder` harness of
 M1 stay in `contracts.py`.
+
+Since Migrator reads R4's record after `initialize` (see `migrator_code`),
+the bad examples that must get through Route A write that record
+(`record_initialization`), as the kernel does; the permissive fallback
+example does not.
 """
 
 from typing import Any
@@ -17,6 +22,7 @@ from .contracts import (
     ECRECOVER,
     ERC1271_MAGIC,
     INITIALIZE,
+    INITIALIZED_CODE_HASH_SLOT,
     INVALID,
     IS_VALID_SIGNATURE,
     P_CHECK,
@@ -25,13 +31,55 @@ from .contracts import (
     assemble,
     ceil32,
     dispatch,
+    function_selector,
     receive_ether,
+    receive_hooks,
     return_word,
 )
 from .helpers import selector
 
 # Custom error of the step harness, outside the reference `ERRORS`.
 HARNESS_SET_CODE_FAILED = selector("HarnessSetCodeFailed()")
+
+
+def record_initialization() -> Bytecode:
+    """
+    TEST ONLY: write R4's record, as the kernel's `initialize` does: the
+    hash of the code now installed, at `INITIALIZED_CODE_HASH_SLOT`.
+    """
+    return Op.SSTORE(INITIALIZED_CODE_HASH_SLOT, Op.EXTCODEHASH(Op.ADDRESS))
+
+
+def bad_example_permissive_fallback_code() -> Bytecode:
+    """
+    TEST ONLY, NOT REFERENCE IMPLEMENTATION: a bad example of FM3 whose
+    fallback succeeds for every selector it does not know.
+
+    It accepts ETH with empty calldata, answers the three receive hooks,
+    answers `isValidSignature` with the invalid value, and returns
+    successfully with no data for anything else, `initialize(bytes)`
+    included. So `address(this).call(initialize(initData))` succeeds while
+    no initialization runs and nothing is recorded. (The same shape as a
+    Safe whose fallback handler is unset: its `FallbackManager` returns
+    with no data for unknown selectors, safe-smart-account 247b8ce; this
+    PoC does not run Safe.)
+    """
+    is_valid = Label()
+    receive_jump, receive_body = receive_ether()
+    hook_cases, hook_bodies = receive_hooks()
+    known = [(IS_VALID_SIGNATURE, is_valid)] + hook_cases
+    return assemble(
+        receive_jump,
+        [
+            Jump(label, Op.EQ(function_selector(), int.from_bytes(sel)))
+            for sel, label in known
+        ],
+        Op.STOP,  # the permissive fallback
+        receive_body,
+        hook_bodies,
+        is_valid,
+        return_word(INVALID),
+    )
 
 
 def bad_example_self_recovery_wallet_code() -> Bytecode:
@@ -42,7 +90,8 @@ def bad_example_self_recovery_wallet_code() -> Bytecode:
     ERC-1271 magic only when `ecrecover(hash, sig)` succeeds with 32 bytes
     of output equal to `ADDRESS`. The output is read correctly; what is bad
     is relying on recovery to the account's own address. `initialize(bytes)`
-    does nothing and succeeds, so the code can pass Route A.
+    writes R4's record and does nothing else, so the code can pass Route A
+    (the record shows only that `initialize` ran, not what the code is).
     """
     initialize, is_valid, invalid = Label(), Label(), Label()
     receive_jump, receive_body = receive_ether()
@@ -52,6 +101,7 @@ def bad_example_self_recovery_wallet_code() -> Bytecode:
         dispatch([(INITIALIZE, initialize), (IS_VALID_SIGNATURE, is_valid)]),
         receive_body,
         initialize,
+        record_initialization(),
         Op.STOP,
         is_valid,
         Jump(invalid, Op.ISZERO(Op.EQ(Op.CALLDATALOAD(signature), 65))),
@@ -120,9 +170,16 @@ def tool_readopting_source_code(replacement: Address) -> Bytecode:
     """
     TEST ONLY, NOT REFERENCE IMPLEMENTATION: a source of FM5 whose code,
     once adopted, replaces the adopting account's code with
-    `replacement`'s on any call (so its `initialize` does), and succeeds.
+    `replacement`'s on any call (so its `initialize` does), then writes
+    R4's record for the code now installed, and succeeds. The record is
+    forged (it names the replacement), so Migrator's check of the record
+    passes and it is `finish` that stops the migration, at P2.
     """
-    return Op.POP(Op.SETCODEFROM(replacement)) + Op.STOP
+    return (
+        Op.POP(Op.SETCODEFROM(replacement))
+        + record_initialization()
+        + Op.STOP
+    )
 
 
 # What the fake ecrecover does while the owner is delegated (P1) ...
@@ -182,12 +239,15 @@ def tool_finish_calling_source_code(*, calls_finish: bool) -> Bytecode:
     `initData` itself, since `p.initDataHash` is the hash of `initData`.)
     With `calls_finish`, `initialize` copies that calldata, calls `p.check`
     with it and all the gas, ignores the result, and succeeds. Without it
-    (the control), `initialize` only succeeds. Any other call reverts.
+    (the control), `initialize` only succeeds. Either way `initialize`
+    first writes R4's record, so Migrator's check of the record passes.
+    Any other call reverts.
     """
     initialize = Label()
     holder = Op.CALLDATALOAD(INIT_DATA_FIRST_WORD)
     body = (
-        Op.EXTCODECOPY(holder, 0, 0, Op.EXTCODESIZE(holder))
+        record_initialization()
+        + Op.EXTCODECOPY(holder, 0, 0, Op.EXTCODESIZE(holder))
         + Op.POP(
             Op.CALL(
                 gas=Op.GAS,
@@ -201,7 +261,7 @@ def tool_finish_calling_source_code(*, calls_finish: bool) -> Bytecode:
     return assemble(
         dispatch([(INITIALIZE, initialize)]),
         initialize,
-        body if calls_finish else Op.STOP,
+        body if calls_finish else record_initialization() + Op.STOP,
     )
 
 

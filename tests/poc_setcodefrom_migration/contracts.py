@@ -110,6 +110,7 @@ ERRORS = [
     "SourceHashMismatch",
     "SetCodeFailed",
     "InitializeFailed",
+    "NotInitialized",
     # Kernel
     "NotSelf",
     "AlreadyInitialized",
@@ -737,6 +738,14 @@ def migrator_code(self_address: Address, check: Address) -> Bytecode:
     `address(this).call(initialize(initData))` succeeds; CHECK.finish.
     Reverts from CHECK are bubbled up. No storage; besides migrate, only
     receive hooks that make no calls.
+
+    Ahead of draft v2.7 (a v2.8 candidate): right after `initialize`
+    returns, `SLOAD(INITIALIZED_CODE_HASH_SLOT) == EXTCODEHASH(this)` is
+    required (`NotInitialized`). v2.7's P3 only requires that the call did
+    not revert, which code with a permissive fallback satisfies without
+    running any initialization. The check reads R4's record, so it shows
+    that code with the R4 record ran; it does not judge the code (code
+    that writes the slot and installs nothing passes).
     """
     migrate = Label()
     revert_from_check = Label()
@@ -834,6 +843,15 @@ def migrator_code(self_address: Address, check: Address) -> Bytecode:
                 args_size=Op.ADD(68, ceil32(init_data_length)),
             ),
             "InitializeFailed",
+        ),
+        # P3, read from the account's own storage (Migrator runs as the
+        # account): R4's record must be the hash of the code now installed.
+        require(
+            Op.EQ(
+                Op.SLOAD(INITIALIZED_CODE_HASH_SLOT),
+                Op.EXTCODEHASH(Op.ADDRESS),
+            ),
+            "NotInitialized",
         ),
         call_check(FINISH),
         Op.STOP,

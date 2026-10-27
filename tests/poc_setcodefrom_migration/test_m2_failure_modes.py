@@ -38,6 +38,7 @@ from ..eip8298_setcodefrom.spec import ref_spec_8298
 from .contracts import (
     ECRECOVER,
     ERC1271_MAGIC,
+    INITIALIZED_CODE_HASH_SLOT,
     INVALID,
     code_hash,
     delegation_indicator,
@@ -309,7 +310,16 @@ def test_fm1_guard_passes_self_recovery(
         ],
         post={
             **deployment.post(),
-            owner: Account(code=SELF_RECOVERY_WALLET, nonce=1, storage={}),
+            owner: Account(
+                code=SELF_RECOVERY_WALLET,
+                nonce=1,
+                # R4's record, written by the wallet's `initialize`.
+                storage={
+                    INITIALIZED_CODE_HASH_SLOT: int.from_bytes(
+                        code_hash(SELF_RECOVERY_WALLET)
+                    )
+                },
+            ),
             recorder: Account(
                 storage=recorded(0, 1, 32, selector_word(INVALID))
             ),
