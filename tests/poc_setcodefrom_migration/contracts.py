@@ -111,6 +111,7 @@ ERRORS = [
     "SetCodeFailed",
     "InitializeFailed",
     "NotInitialized",
+    "StaleRecord",
     # Kernel
     "NotSelf",
     "AlreadyInitialized",
@@ -734,8 +735,10 @@ def migrator_code(self_address: Address, check: Address) -> Bytecode:
     never at its own address; `msg.sender == p.executor`;
     `p.executor != ENTRY_POINT` (added ahead of draft v2.7);
     `keccak256(initData) == p.initDataHash`; CHECK.begin;
-    `EXTCODEHASH(p.source) == p.codeHash`; `SETCODEFROM(p.source) == 1`;
-    `address(this).call(initialize(initData))` succeeds; CHECK.finish.
+    `EXTCODEHASH(p.source) == p.codeHash`; the stale-record check (below);
+    `SETCODEFROM(p.source) == 1`;
+    `address(this).call(initialize(initData))` succeeds; the check of R4's
+    record (below); CHECK.finish.
     Reverts from CHECK are bubbled up. No storage; besides migrate, only
     receive hooks that make no calls.
 
@@ -746,6 +749,14 @@ def migrator_code(self_address: Address, check: Address) -> Bytecode:
     running any initialization. The check reads R4's record, so it shows
     that code with the R4 record ran; it does not judge the code (code
     that writes the slot and installs nothing passes).
+
+    Also ahead of draft v2.7 (a v2.8 candidate): right before `SETCODEFROM`,
+    `SLOAD(INITIALIZED_CODE_HASH_SLOT) != p.codeHash` is required
+    (`StaleRecord`). Without it, a record of the new code's hash left by an
+    earlier delegate would satisfy the check after `initialize` with nothing
+    run. The slot need not be empty: an earlier initialization can leave a
+    different hash there. Like the check after `initialize`, it reads only
+    the record's value; it does not judge the code.
     """
     migrate = Label()
     revert_from_check = Label()
@@ -821,6 +832,16 @@ def migrator_code(self_address: Address, check: Address) -> Bytecode:
                 Op.CALLDATALOAD(P_CODE_HASH),
             ),
             "SourceHashMismatch",
+        ),
+        # Stale record: R4's slot must not already name the code to adopt.
+        require(
+            Op.ISZERO(
+                Op.EQ(
+                    Op.SLOAD(INITIALIZED_CODE_HASH_SLOT),
+                    Op.CALLDATALOAD(P_CODE_HASH),
+                )
+            ),
+            "StaleRecord",
         ),
         require(
             Op.EQ(Op.SETCODEFROM(Op.CALLDATALOAD(P_SOURCE)), 1),

@@ -43,6 +43,7 @@ from .contracts import (
     FINISH,
     INITIALIZED_CODE_HASH_SLOT,
     INVALID,
+    code_hash,
     migration_check_code,
     recorder_code,
     verifier_code,
@@ -50,6 +51,7 @@ from .contracts import (
 from .harness import (
     STEP_CALL,
     STEP_SET_CODE,
+    bad_example_permissive_fallback_code,
     step,
     tool_step_harness_code,
 )
@@ -731,9 +733,12 @@ def test_kernel_initialize_rejected(
       whose proof is valid over the malformed words.
 
     `direct` and `recorded` run Route A: the whole migration reverts with
-    `InitializeFailed` (Migrator does not bubble the kernel's error).
+    `InitializeFailed` (Migrator does not bubble the kernel's error), except
+    `already_initialized`, which Migrator refuses before `SETCODEFROM` with
+    `StaleRecord` (the record already names the kernel; a v2.8 candidate).
     `inner` runs SETCODEFROM and `initialize` as the owner through the step
-    harness (TEST ONLY) and records the kernel's own error. The owner's
+    harness (TEST ONLY), bypassing Migrator, and records the kernel's own
+    error (`AlreadyInitialized` for `already_initialized`). The owner's
     storage stays as it was.
     """
     deployment = deploy(pre)
@@ -794,8 +799,76 @@ def test_kernel_initialize_rejected(
         init=init,
         signature=owner_signature(owner, p.digest(CHAIN_ID, owner)),
         via_recorder=via_recorder,
-        reason="InitializeFailed",
+        reason="StaleRecord"
+        if case == "already_initialized"
+        else "InitializeFailed",
         auth_nonce=auth_nonce,
+        owner_storage=owner_storage,
+    )
+
+
+@with_form
+@pytest.mark.parametrize(
+    "prior", ["stale", "other_hash"], ids=["stale", "other_hash"]
+)
+def test_route_a_prior_record(
+    blockchain_test: BlockchainTestFiller,
+    pre: Alloc,
+    fork: Fork,
+    prior: str,
+    via_recorder: bool,
+) -> None:
+    """
+    Test Migrator's check of R4's slot before `SETCODEFROM` (a v2.8
+    candidate): the owner is still delegated to an earlier delegate that
+    left a value at `INITIALIZED_CODE_HASH_SLOT`.
+
+    - `stale`: the value is the hash of the code to adopt, test-only code
+      whose fallback accepts every selector (from `harness.py`). Migrator
+      reverts with `StaleRecord`, on both trees; nothing is adopted and the
+      storage stays. Without the check, the left record would satisfy the
+      check after `initialize` with nothing run.
+    - `other_hash`: the value is another code's hash (`Op.STOP`), and the
+      kernel is adopted through the usual Route A. The slot need not be
+      empty: with EIP-8151 the migration completes, emits `Migrated`, and
+      the kernel's `initialize` overwrites the record with its own hash.
+      Without EIP-8151 it stops at P4 and the storage stays.
+    """
+    deployment = deploy(pre)
+    relayer = pre.fund_eoa()
+    recorder = deploy_recorder(pre, 0)
+    executor = recorder if via_recorder else relayer
+    if prior == "stale":
+        permissive = bad_example_permissive_fallback_code()
+        prior_hash = code_hash(permissive)
+    else:
+        prior_hash = code_hash(Op.STOP)
+    owner_storage = {INITIALIZED_CODE_HASH_SLOT: int.from_bytes(prior_hash)}
+    owner = already_delegated_owner(pre, owner_storage)
+    init = registration(owner, deployment.verifier, NEW_KEY)
+    p = intent(deployment, executor, init)
+    if prior == "stale":
+        p = replace(
+            p,
+            source=pre.deploy_contract(permissive),
+            code_hash=prior_hash,
+        )
+        reason: str | None = "StaleRecord"
+    else:
+        reason = refusal_without_8151(fork)
+    run_rejected(
+        blockchain_test,
+        pre,
+        deployment=deployment,
+        owner=owner,
+        relayer=relayer,
+        recorder=recorder,
+        p=p,
+        init=init,
+        signature=owner_signature(owner, p.digest(CHAIN_ID, owner)),
+        via_recorder=via_recorder,
+        reason=reason,
+        auth_nonce=1,
         owner_storage=owner_storage,
     )
 

@@ -37,8 +37,8 @@ export UV_PYTHON=${UV_PYTHON:-3.12}
 TESTS=tests/bogota/poc_setcodefrom_migration
 
 declare -A EXPECTED=(
-    [wt-both]="246 passed"
-    [wt-8298]="238 passed, 8 skipped"
+    [wt-both]="254 passed"
+    [wt-8298]="246 passed, 8 skipped"
 )
 
 outputs=()
