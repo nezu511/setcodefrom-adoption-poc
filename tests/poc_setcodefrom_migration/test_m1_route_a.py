@@ -28,7 +28,6 @@ from execution_testing import (
     Bytecode,
     Fork,
     Hash,
-    Initcode,
     Op,
     StateTestFiller,
     Storage,
@@ -71,6 +70,7 @@ from .contracts import (
     kernel_code,
     migration_check_code,
     migrator_code,
+    migrator_initcode,
     recorder_code,
     verifier_code,
 )
@@ -105,57 +105,69 @@ KERNEL = kernel_code()
 
 @dataclass(frozen=True)
 class Deployment:
-    """The PoC contracts, with the block that deploys Migrator and Check."""
+    """
+    The PoC contracts, with the block in which Migrator is created (and
+    creates its MigrationCheck).
+    """
 
     verifier: Address
     template: Address
     migrator: Address
     check: Address
+    check_hash: Hash
     block: Block
 
     def post(self) -> Dict[Address, Account]:
-        """Return the deployed code of Migrator and MigrationCheck."""
+        """
+        Return the code that Migrator's and MigrationCheck's constructors
+        must have written (the immutables included).
+        """
         return {
             self.migrator: Account(
-                code=migrator_code(self.migrator, self.check)
+                code=migrator_code(self.migrator, self.check, self.check_hash)
             ),
             self.check: Account(code=migration_check_code(self.migrator)),
         }
 
 
-def deploy(pre: Alloc) -> Deployment:
+def creation_block(
+    pre: Alloc, initcode: bytes
+) -> tuple[Address, Address, Block]:
     """
-    Deploy the verifier and the inert kernel template in the pre-state, and
-    return a block in which a deployer EOA creates Migrator and
-    MigrationCheck, whose addresses are computed beforehand because each
-    holds the other's (and Migrator its own) as a constant.
+    Return the addresses of Migrator and its MigrationCheck, and a block in
+    which a deployer EOA sends Migrator's initcode in one creation
+    transaction. Migrator's constructor creates the MigrationCheck with its
+    first nonce (1).
     """
-    verifier = pre.deploy_contract(verifier_code())
-    template = pre.deploy_contract(KERNEL)
     deployer = pre.fund_eoa()
     migrator = compute_create_address(address=deployer, nonce=0)
-    check = compute_create_address(address=deployer, nonce=1)
+    check = compute_create_address(address=migrator, nonce=1)
     block = Block(
         txs=[
             Transaction(
                 sender=deployer,
                 nonce=0,
                 to=None,
-                data=Initcode(deploy_code=migrator_code(migrator, check)),
-                gas_limit=GAS_LIMIT,
-                expected_receipt=TransactionReceipt(status=1),
-            ),
-            Transaction(
-                sender=deployer,
-                nonce=1,
-                to=None,
-                data=Initcode(deploy_code=migration_check_code(migrator)),
+                data=initcode,
                 gas_limit=GAS_LIMIT,
                 expected_receipt=TransactionReceipt(status=1),
             ),
         ]
     )
-    return Deployment(verifier, template, migrator, check, block)
+    return migrator, check, block
+
+
+def deploy(pre: Alloc) -> Deployment:
+    """
+    Deploy the verifier and the inert kernel template in the pre-state, and
+    return a block in which a deployer EOA creates Migrator, which creates
+    its MigrationCheck in its constructor.
+    """
+    verifier = pre.deploy_contract(verifier_code())
+    template = pre.deploy_contract(KERNEL)
+    migrator, check, block = creation_block(pre, migrator_initcode())
+    check_hash = code_hash(migration_check_code(migrator))
+    return Deployment(verifier, template, migrator, check, check_hash, block)
 
 
 def registration(
@@ -458,7 +470,8 @@ def test_route_a_migration(
                 # Withheld: a successful call with empty output.
                 **recorded(PROBE_ECRECOVER, 1, 0, 0),
                 **recorded(PROBE_NEW_KEY, 1, 32, selector_word(ERC1271_MAGIC)),
-                # R1: the old key is no authority of the kernel.
+                # The old key's 65-byte signature, refused by the P256
+                # verifier for its length (not a test of R1).
                 **recorded(PROBE_OLD_KEY, 1, 32, selector_word(INVALID)),
                 **{
                     key: value
@@ -884,6 +897,10 @@ def verify_calldata(key: bytes, digest: Hash, signature: bytes) -> bytes:
         pytest.param(
             "signature_length_lies", False, id="signature_length_lies"
         ),
+        pytest.param("key_offset_lies", False, id="key_offset_lies"),
+        pytest.param(
+            "signature_offset_lies", False, id="signature_offset_lies"
+        ),
     ],
 )
 def test_p256_verifier(
@@ -919,6 +936,12 @@ def test_p256_verifier(
         edited = bytearray(verify_calldata(key, digest, signature))
         head = 4 + (0x60 if case == "key_length_lies" else 0xC0)
         edited[head : head + 32] = (32).to_bytes(32, "big")
+        calldata = bytes(edited)
+    elif case in ("key_offset_lies", "signature_offset_lies"):
+        # Canonical size, but one offset word points elsewhere.
+        edited = bytearray(verify_calldata(key, digest, signature))
+        head = 4 if case == "key_offset_lies" else 68
+        edited[head : head + 32] = (0x1000).to_bytes(32, "big")
         calldata = bytes(edited)
     else:
         raise ValueError(f"unknown case: {case}")

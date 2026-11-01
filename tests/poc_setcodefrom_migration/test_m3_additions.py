@@ -288,8 +288,8 @@ def test_adopted_initialize_calls_finish(
     Test Route A through the production Migrator and MigrationCheck when
     the adopted code's `initialize` calls `MigrationCheck.finish(p,
     ownerSig)` itself, as the account, and ignores the result (test-only
-    code from `harness.py`). This pins a PoC choice: `finish` consumes the
-    (account, D) link (v2.7 candidate 14).
+    code from `harness.py`). This checks v2.7's Route A details, "Linking
+    `begin` and `finish`": `finish` consumes the (account, D) link.
 
     - `initialize_calls_finish`, with EIP-8151: the inner `finish` passes
       (and emits `Migrated`) and clears the mark, so Migrator's own

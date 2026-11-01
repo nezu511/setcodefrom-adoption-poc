@@ -2,9 +2,11 @@
 Test-only contracts of M2 and M3. NONE OF THIS IS REFERENCE IMPLEMENTATION.
 
 They are bad examples of adopted code, sources that change, a fake
-ecrecover, a stipend sender, a step harness and code whose `initialize`
-calls `finish`, used only to reproduce the failure modes and to reach the
-guard's checks. The reference contracts
+ecrecover, a stipend sender, a step harness, code whose `initialize`
+calls `finish`, code that only writes R4's record, code that stores a
+word of its `initialize` calldata and a verifier that writes storage,
+used only to reproduce the failure modes and to reach the guard's
+checks. The reference contracts
 (verifier, kernel, MigrationCheck, Migrator) and the `Recorder` harness of
 M1 stay in `contracts.py`.
 
@@ -26,6 +28,7 @@ from .contracts import (
     INVALID,
     IS_VALID_SIGNATURE,
     P_CHECK,
+    VERIFIER_MAGIC,
     Jump,
     Label,
     assemble,
@@ -139,6 +142,48 @@ def bad_example_revert_everything_code() -> Bytecode:
     with no receive path that reverts whatever it is called with.
     """
     return Op.REVERT(0, 0)
+
+
+def bad_example_record_only_code() -> Bytecode:
+    """
+    TEST ONLY, NOT REFERENCE IMPLEMENTATION: code that, on any call, writes
+    R4's record and stops. It installs nothing, so an account that adopts
+    it is left to whoever adopts it next; the tests use it as the code an
+    attacker would choose.
+    """
+    return record_initialization() + Op.STOP
+
+
+# Slot where `tool_init_data_reader_code` stores the word it reads.
+INIT_DATA_READER_SLOT = 0
+# Calldata offset of the second word of `initData` in `initialize(bytes)`.
+INIT_DATA_SECOND_WORD = 4 + 32 + 32 + 32
+
+
+def tool_init_data_reader_code() -> Bytecode:
+    """
+    TEST ONLY, NOT REFERENCE IMPLEMENTATION: code to adopt that, on any
+    call (so its `initialize`), writes R4's record and stores the second
+    word of `initData` in its `initialize(bytes)` calldata,
+    `CALLDATALOAD(100)`, at `INIT_DATA_READER_SLOT`. With `initData`
+    shorter than 64 bytes, that word holds the padding `Migrator` passed.
+    """
+    return (
+        record_initialization()
+        + Op.SSTORE(
+            INIT_DATA_READER_SLOT, Op.CALLDATALOAD(INIT_DATA_SECOND_WORD)
+        )
+        + Op.STOP
+    )
+
+
+def tool_stateful_verifier_code() -> Bytecode:
+    """
+    TEST ONLY, NOT REFERENCE IMPLEMENTATION: a verifier that writes its own
+    storage (slot 0) and then returns the ERC-7913 magic for any input. A
+    kernel that calls it with `STATICCALL` sees the call fail.
+    """
+    return Op.SSTORE(0, 1) + return_word(VERIFIER_MAGIC)
 
 
 def tool_stipend_sender_code() -> Bytecode:

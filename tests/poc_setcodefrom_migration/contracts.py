@@ -6,6 +6,9 @@ Bytecode of the PoC contracts, written with the `Op` DSL.
 - `MigrationCheck` and `Migrator` (Route A),
 - `Recorder`, a test harness that records the outcome of one call.
 
+`Migrator` and `MigrationCheck` are deployed from initcode whose
+constructor writes immutables into the runtime code (see `Immutables`).
+
 The kernel implements R1, R3, R4, R7 and R8 only. This tree has no
 EIP-8141, so it has no `VERIFY` (R2) and no relay path: an account that
 adopts it cannot act afterwards. It shows the guard and Route A, not a
@@ -15,6 +18,7 @@ Jumps use `Label`s resolved by `assemble`, with a fixed `PUSH2` per jump.
 """
 
 from dataclasses import dataclass, field
+from functools import cache
 from itertools import count
 from typing import Any, Iterable, Union
 
@@ -28,6 +32,7 @@ from .helpers import (
     NAME_HASH,
     REGISTRATION_TYPEHASH,
     SCOPE_EXECUTION,
+    SCOPE_PAYMENT,
     VERSION_HASH,
     keccak,
     selector,
@@ -106,6 +111,7 @@ ERRORS = [
     "AtMigratorAddress",
     "NotExecutor",
     "ExecutorIsEntryPoint",
+    "CheckCodeMismatch",
     "InitDataMismatch",
     "SourceHashMismatch",
     "SetCodeFailed",
@@ -207,6 +213,125 @@ def require(condition: Bytecode, name: str) -> list[Any]:
     """Revert with `name()` unless `condition` is non-zero."""
     ok = Label()
     return [Jump(ok, condition), revert_with(name), ok]
+
+
+def push_operands(code: bytes) -> dict[int, int]:
+    """Return {offset of the push data: its length} of each PUSH in `code`."""
+    operands = {}
+    position = 0
+    while position < len(code):
+        opcode = code[position]
+        if 0x60 <= opcode <= 0x7F:
+            operands[position + 1] = opcode - 0x5F
+            position += opcode - 0x5F
+        position += 1
+    return operands
+
+
+class Immutables:
+    """
+    Values that a constructor learns when it runs and writes into the
+    runtime code it returns, as Solidity's immutables.
+
+    Each use is a `PUSH32`. `push(name)` returns one with a sentinel
+    operand unique to that use; `template` then finds every sentinel in
+    the assembled code and returns the code with those operands zeroed
+    and their offsets, by name. The constructor copies the template to
+    memory and `MSTORE`s each value over its 32-byte operand.
+    """
+
+    def __init__(self, contract: str) -> None:
+        self.contract = contract
+        self.sentinels: dict[str, list[bytes]] = {}
+
+    def push(self, name: str) -> Bytecode:
+        """Return a `PUSH32` for one use of the immutable `name`."""
+        uses = self.sentinels.setdefault(name, [])
+        sentinel = keccak(
+            f"immutable:{self.contract}:{name}:{len(uses)}".encode()
+        )
+        uses.append(bytes(sentinel))
+        return Op.PUSH32(int.from_bytes(sentinel))
+
+    def template(self, code: Bytecode, uses: dict[str, int]) -> "Template":
+        """
+        Return `code` with the sentinels zeroed, after checking that `uses`
+        gives the number of uses of each name, and that each sentinel
+        occurs once, as the operand of a `PUSH32`.
+        """
+        raw = bytearray(bytes(code))
+        operands = push_operands(bytes(raw))
+        assert {n: len(s) for n, s in self.sentinels.items()} == uses
+        offsets: dict[str, list[int]] = {}
+        for name, sentinels in self.sentinels.items():
+            for sentinel in sentinels:
+                at = raw.find(sentinel)
+                assert at > 0 and raw.find(sentinel, at + 1) == -1
+                assert raw[at - 1] == 0x7F and operands.get(at) == 32
+                raw[at : at + 32] = bytes(32)
+                offsets.setdefault(name, []).append(at)
+        return Template(bytes(raw), offsets)
+
+
+@dataclass(frozen=True)
+class Template:
+    """Runtime code whose immutable operands are zero, and their offsets."""
+
+    code: bytes
+    offsets: dict[str, list[int]]
+
+    def fill(self, values: dict[str, bytes]) -> bytes:
+        """Return the code with each operand set to its 32-byte value."""
+        assert values.keys() == self.offsets.keys()
+        code = bytearray(self.code)
+        for name, offsets in self.offsets.items():
+            assert len(values[name]) == 32
+            for at in offsets:
+                code[at : at + 32] = values[name]
+        return bytes(code)
+
+
+def as_word(value: Address | Hash) -> bytes:
+    """Return `value` as one 32-byte word, as `MSTORE` writes it."""
+    return bytes(value).rjust(32, b"\x00")
+
+
+def constructor_initcode(
+    template: Template,
+    values: dict[str, Bytecode],
+    *,
+    memory: int,
+    prologue: Any = lambda _: [],
+    trailer: bytes = b"",
+) -> bytes:
+    """
+    Return `constructor ‖ template.code ‖ trailer`. The constructor runs
+    `prologue(offset of trailer)`, copies the template to `memory`, writes
+    each value (code that pushes it) over its operands with `MSTORE`, and
+    returns the runtime code.
+
+    Offsets and lengths inside the initcode are pushed with a fixed
+    `PUSH2`, and the constructor is built twice: once to learn its size,
+    then with the offsets that follow from it.
+    """
+    size = len(template.code)
+
+    def constructor(start: int) -> Bytecode:
+        return assemble(
+            prologue(Op.PUSH2(start + size)),
+            Op.CODECOPY(memory, Op.PUSH2(start), Op.PUSH2(size)),
+            [
+                Op.MSTORE(memory + at, values[name])
+                for name, offsets in template.offsets.items()
+                for at in offsets
+            ],
+            Op.RETURN(memory, Op.PUSH2(size)),
+        )
+
+    start = len(constructor(0))
+    code = constructor(start)
+    assert len(code) == start
+    return bytes(code) + template.code + trailer
 
 
 def return_word(value: bytes) -> Bytecode:
@@ -493,7 +618,10 @@ def kernel_code() -> Bytecode:
         require(
             Op.AND(
                 Op.ISZERO(Op.SHR(160, Op.MLOAD(K_VERIFIER))),
-                Op.ISZERO(Op.SHR(8, scope)),
+                # Only EIP-8141's approval bits (payment, execution).
+                Op.ISZERO(
+                    Op.AND(scope, Op.NOT(SCOPE_PAYMENT | SCOPE_EXECUTION))
+                ),
             ),
             "BadInitData",
         ),
@@ -638,25 +766,27 @@ def _ecrecover_owner_signature(ecrecover: Address) -> Bytecode:
     )
 
 
-def migration_check_code(
-    migrator: Address, ecrecover: Address = ECRECOVER
-) -> Bytecode:
+@cache
+def _migration_check_template(ecrecover: Address) -> Template:
     """
-    Return `MigrationCheck` bound to `migrator` (Route A only).
+    Return the runtime code of `MigrationCheck` (Route A only), with its
+    one immutable, `MIGRATOR_INDICATOR_HASH`, still zero.
 
     `ecrecover` is the precompile `0x01`; only tests pass another address
     (a fake ecrecover, never part of the reference implementation).
 
-    - begin: route A (caller holds the delegation indicator to `migrator`),
-      `p.check == this`, deadline, not revoked, P1; then marks (account, D)
-      in transient storage with the hash of ownerSig.
+    - begin: route A (caller holds the delegation indicator to its
+      `Migrator`: `EXTCODEHASH(caller) == MIGRATOR_INDICATOR_HASH`),
+      `p.check == this`, deadline, not revoked, P1; then marks
+      (account, D) in transient storage with the hash of ownerSig.
     - finish: the mark (cleared), P2, P4 (`success == 1` and
       `returndatasize == 0`; 32 zero bytes are refused), then `Migrated`.
     - revoke(D): records (msg.sender, D).
     """
     begin, finish, revoke = Label(), Label(), Label()
-    indicator_hash = keccak(delegation_indicator(migrator))
-    return assemble(
+    immutables = Immutables("MigrationCheck")
+    indicator_hash = immutables.push("MIGRATOR_INDICATOR_HASH")
+    code = assemble(
         dispatch([(BEGIN, begin), (FINISH, finish), (REVOKE, revoke)]),
         # --- begin(p, ownerSig) ------------------------------------------
         begin,
@@ -711,6 +841,45 @@ def migration_check_code(
         + Op.SSTORE(Op.SHA3(0, 64), 1)
         + Op.STOP,
     )
+    return immutables.template(code, {"MIGRATOR_INDICATOR_HASH": 1})
+
+
+def migration_check_code(
+    migrator: Address, ecrecover: Address = ECRECOVER
+) -> bytes:
+    """
+    Return the runtime code of `MigrationCheck` as `migrator` creates it:
+    `MIGRATOR_INDICATOR_HASH` is the hash of the delegation indicator to
+    `migrator`.
+
+    Tests also place this code directly, with any address as `migrator`.
+    """
+    return _migration_check_template(ecrecover).fill(
+        {
+            "MIGRATOR_INDICATOR_HASH": as_word(
+                keccak(delegation_indicator(migrator))
+            )
+        }
+    )
+
+
+def migration_check_initcode(ecrecover: Address = ECRECOVER) -> bytes:
+    """
+    Return the initcode of `MigrationCheck`. Its constructor learns its
+    `Migrator` from `msg.sender` (`CALLER`): it hashes the 23-byte
+    delegation indicator `0xef0100 ‖ CALLER` and writes the hash into
+    the runtime code as `MIGRATOR_INDICATOR_HASH`.
+    """
+    return constructor_initcode(
+        _migration_check_template(ecrecover),
+        {"MIGRATOR_INDICATOR_HASH": Op.MLOAD(0x20)},
+        memory=0x40,
+        # Bytes 9..31 of word 0 hold the indicator; its hash goes to 0x20.
+        prologue=lambda _: Op.MSTORE(
+            0, Op.OR(Op.SHL(160, 0xEF0100), Op.CALLER)
+        )
+        + Op.MSTORE(0x20, Op.SHA3(9, 23)),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -727,13 +896,17 @@ M_INITIALIZE_CALL = 0x140
 M_CHECK_CALL = 0x200  # begin/finish calldata, then initData for hashing
 
 
-def migrator_code(self_address: Address, check: Address) -> Bytecode:
+@cache
+def _migrator_template() -> Template:
     """
-    Return `Migrator`, deployed at `self_address` and bound to `check`.
+    Return the runtime code of `Migrator`, with its immutables still zero:
+    `SELF` (its own address), `CHECK` (the `MigrationCheck` it created)
+    and `CHECK_HASH` (that contract's code hash right after creation).
 
     migrate(p, initData, ownerSig), following the Route A pseudo-code:
     never at its own address; `msg.sender == p.executor`;
-    `p.executor != ENTRY_POINT` (added ahead of draft v2.7);
+    `p.executor != ENTRY_POINT` (v2.7's Route A details, "Executor");
+    `EXTCODEHASH(CHECK) == CHECK_HASH` (below);
     `keccak256(initData) == p.initDataHash`; CHECK.begin;
     `EXTCODEHASH(p.source) == p.codeHash`; the stale-record check (below);
     `SETCODEFROM(p.source) == 1`;
@@ -757,8 +930,24 @@ def migrator_code(self_address: Address, check: Address) -> Bytecode:
     run. The slot need not be empty: an earlier initialization can leave a
     different hash there. Like the check after `initialize`, it reads only
     the record's value; it does not judge the code.
+
+    Also beyond draft v2.7 (a v2.8 candidate): the constructor creates the
+    `MigrationCheck` and records its code hash (`migrator_initcode`), and
+    every `migrate` requires `EXTCODEHASH(CHECK) == CHECK_HASH`
+    (`CheckCodeMismatch`) before calling `begin`. A call to an address
+    without code succeeds, so without the check, a `MigrationCheck` that
+    is missing would let `begin` and `finish` succeed with nothing run.
+    That happens when `Migrator`'s runtime code is placed without running
+    its constructor, as a genesis preinstall can do. The check also
+    requires the recorded hash to be neither 0 nor `keccak256("")`, the
+    two values `EXTCODEHASH` gives for an account without code, so that
+    `CHECK` has code: runtime code whose immutables were never filled (a
+    compiler's `deployedBytecode` leaves them zero) or were filled with
+    such a hash is refused too. The check reads `CHECK`, the address
+    recorded in this code, not `p.check`.
     """
     migrate = Label()
+    immutables = Immutables("Migrator")
     revert_from_check = Label()
     hook_cases, hook_bodies = receive_hooks()
     receive_jump, receive_body = receive_ether()
@@ -777,7 +966,7 @@ def migrator_code(self_address: Address, check: Address) -> Bytecode:
                 Op.ISZERO(
                     Op.CALL(
                         gas=Op.GAS,
-                        address=check,
+                        address=immutables.push("CHECK"),
                         args_offset=M_CHECK_CALL,
                         args_size=Op.MLOAD(M_CHECK_CALL_SIZE),
                     )
@@ -785,19 +974,39 @@ def migrator_code(self_address: Address, check: Address) -> Bytecode:
             ),
         ]
 
-    return assemble(
+    code = assemble(
         receive_jump,
         dispatch([(MIGRATE, migrate)] + hook_cases),
         receive_body,
         hook_bodies,
         migrate,
         require(
-            Op.ISZERO(Op.EQ(Op.ADDRESS, self_address)), "AtMigratorAddress"
+            Op.ISZERO(Op.EQ(Op.ADDRESS, immutables.push("SELF"))),
+            "AtMigratorAddress",
         ),
         require(Op.EQ(Op.CALLER, Op.CALLDATALOAD(P_EXECUTOR)), "NotExecutor"),
         require(
             Op.ISZERO(Op.EQ(Op.CALLDATALOAD(P_EXECUTOR), ENTRY_POINT)),
             "ExecutorIsEntryPoint",
+        ),
+        # The MigrationCheck still holds the code it had when created:
+        # EXTCODEHASH(CHECK) == CHECK_HASH, and CHECK_HASH is neither 0 nor
+        # keccak256(""), so CHECK has code. CHECK_HASH is pushed once.
+        require(
+            immutables.push("CHECK_HASH")  # [h]
+            + Op.DUP1  # [h, h]
+            + Op.EXTCODEHASH(immutables.push("CHECK"))
+            + Op.EQ  # [h, h == EXTCODEHASH(CHECK)]
+            + Op.SWAP1
+            + Op.DUP1
+            + Op.PUSH32(int.from_bytes(EMPTY_CODE_HASH))
+            + Op.EQ  # [match, h, h == keccak256("")]
+            + Op.SWAP1
+            + Op.ISZERO
+            + Op.OR  # [match, h == keccak256("") || h == 0]
+            + Op.ISZERO
+            + Op.AND,
+            "CheckCodeMismatch",
         ),
         Op.MSTORE(
             M_INIT_DATA_HEAD, Op.ADD(4, Op.CALLDATALOAD(INIT_DATA_OFFSET))
@@ -854,7 +1063,7 @@ def migrator_code(self_address: Address, check: Address) -> Bytecode:
         + Op.CALLDATACOPY(
             Op.ADD(initialize_call, 36),
             init_data_head,
-            Op.ADD(32, ceil32(init_data_length)),
+            Op.ADD(32, init_data_length),
         ),
         require(
             Op.CALL(
@@ -879,6 +1088,80 @@ def migrator_code(self_address: Address, check: Address) -> Bytecode:
         revert_from_check,
         Op.RETURNDATACOPY(0, 0, Op.RETURNDATASIZE)
         + Op.REVERT(0, Op.RETURNDATASIZE),
+    )
+    return immutables.template(code, {"CHECK": 3, "SELF": 1, "CHECK_HASH": 1})
+
+
+def migrator_code(
+    self_address: Address, check: Address, check_hash: Hash
+) -> bytes:
+    """
+    Return the runtime code of `Migrator` as its constructor writes it at
+    `self_address`: `SELF = self_address`, `CHECK = check` (the address of
+    the `MigrationCheck` it created) and `CHECK_HASH = check_hash`.
+    """
+    return _migrator_template().fill(
+        {
+            "SELF": as_word(self_address),
+            "CHECK": as_word(check),
+            "CHECK_HASH": as_word(check_hash),
+        }
+    )
+
+
+EMPTY_CODE_HASH = keccak(b"")
+# Memory of Migrator's constructor.
+X_CHECK = 0x00
+X_CHECK_HASH = 0x20
+X_CREATE_INPUT = 0x40
+
+
+def migrator_initcode(ecrecover: Address = ECRECOVER) -> bytes:
+    """
+    Return the initcode of `Migrator`: constructor ‖ runtime template ‖
+    `MigrationCheck`'s initcode (built with `ecrecover`).
+
+    The constructor creates the `MigrationCheck` with `CREATE` (at
+    `compute_create_address(Migrator, 1)`, a contract's first nonce), and
+    reverts with `CheckCodeMismatch` unless `CREATE` returned an address
+    whose code hash is neither 0 nor `keccak256("")`. It then writes
+    `ADDRESS`, that address and that hash into the runtime code as `SELF`,
+    `CHECK` and `CHECK_HASH`. Nothing in the initcode depends on the
+    deployer or on `Migrator`'s address.
+    """
+    check_initcode = migration_check_initcode(ecrecover)
+    check_size = len(check_initcode)
+    check = Op.MLOAD(X_CHECK)
+    check_hash = Op.MLOAD(X_CHECK_HASH)
+
+    def prologue(trailer: Bytecode) -> list[Any]:
+        return [
+            Op.CODECOPY(X_CREATE_INPUT, trailer, Op.PUSH2(check_size))
+            + Op.MSTORE(
+                X_CHECK, Op.CREATE(0, X_CREATE_INPUT, Op.PUSH2(check_size))
+            )
+            + Op.MSTORE(X_CHECK_HASH, Op.EXTCODEHASH(check)),
+            require(
+                Op.AND(
+                    Op.AND(
+                        Op.ISZERO(Op.ISZERO(check)),
+                        Op.ISZERO(Op.ISZERO(check_hash)),
+                    ),
+                    Op.ISZERO(
+                        Op.EQ(check_hash, int.from_bytes(EMPTY_CODE_HASH))
+                    ),
+                ),
+                "CheckCodeMismatch",
+            ),
+        ]
+
+    return constructor_initcode(
+        _migrator_template(),
+        {"SELF": Op.ADDRESS, "CHECK": check, "CHECK_HASH": check_hash},
+        # The runtime code is copied after CREATE's input.
+        memory=X_CREATE_INPUT + (check_size + 31) // 32 * 32,
+        prologue=prologue,
+        trailer=check_initcode,
     )
 
 

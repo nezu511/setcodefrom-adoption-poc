@@ -22,6 +22,7 @@ from execution_testing import (
     Fork,
     Header,
     Op,
+    Storage,
     Transaction,
     TransactionException,
     TransactionReceipt,
@@ -320,6 +321,80 @@ def test_fm1_guard_passes_self_recovery(
                     )
                 },
             ),
+            recorder: Account(
+                storage=recorded(0, 1, 32, selector_word(INVALID))
+            ),
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "authority",
+    [
+        pytest.param("no_authority", id="no_authority"),
+        pytest.param(
+            "with_authority",
+            id="with_authority",
+            # An EOA with code needs a mutable pre-state.
+            marks=pytest.mark.pre_alloc_mutable,
+        ),
+    ],
+)
+def test_kernel_never_self_recovers(
+    blockchain_test: BlockchainTestFiller,
+    pre: Alloc,
+    authority: str,
+) -> None:
+    """
+    A1d. Test one case of R1 on the reference kernel: an account holds the
+    kernel, and the old key signs the `AccountMessage` digest of a message
+    for that account. `isValidSignature` gives `0xffffffff`.
+
+    - `no_authority`: the kernel is adopted through the simple shell and
+      not initialized (FM1's trap: code that falls back to the EOA's key
+      when it has none).
+    - `with_authority`: the account holds the kernel with an installed
+      authority (`NEW_KEY`), so `isValidSignature` gets past its scope
+      check before refusing; a self-recovery placed after that check is
+      reached only here.
+
+    Run on both trees, but only `wt-8298` can detect a violation: with
+    EIP-8151, `ecrecover` returns empty output for an address with code, so
+    code that recovered against its own address would refuse the old key
+    anyway.
+    """
+    relayer = pre.fund_eoa()
+    prober = pre.fund_eoa()
+    recorder = deploy_recorder(pre, 0)
+    blocks = []
+    if authority == "no_authority":
+        owner = pre.fund_eoa()
+        template = pre.deploy_contract(KERNEL)
+        blocks.append(shell_adoption(pre, owner, relayer, template))
+        owner_storage = {RESULT_SLOT: 1}
+    else:
+        verifier = pre.deploy_contract(verifier_code())
+        owner_storage = kernel_storage(verifier, NEW_KEY)
+        installed = Storage()
+        for slot, value in owner_storage.items():
+            installed[slot] = value
+        owner = pre.fund_eoa(code=KERNEL, storage=installed)
+    message = account_message_digest(CHAIN_ID, owner, MESSAGE_HASH)
+    old_key_check = Transaction(
+        sender=prober,
+        to=recorder,
+        data=record(
+            0,
+            owner,
+            is_valid_signature(MESSAGE_HASH, owner_signature(owner, message)),
+        ),
+        gas_limit=GAS_LIMIT,
+    )
+    blockchain_test(
+        pre=pre,
+        blocks=[*blocks, Block(txs=[old_key_check])],
+        post={
+            owner: Account(code=KERNEL, storage=owner_storage),
             recorder: Account(
                 storage=recorded(0, 1, 32, selector_word(INVALID))
             ),
@@ -943,7 +1018,7 @@ def test_fm6_p1_p4_against_fake_ecrecover(
 ) -> None:
     """
     A5c. Test P1 and P4 against a fake ecrecover (TEST ONLY), with a
-    `MigrationCheck` and Migrator bound to it. The fake ignores EIP-8151,
+    Migrator whose `MigrationCheck` calls it. The fake ignores EIP-8151,
     so both trees give the same result.
 
     - `zero_word`: owner while delegated, then 32 zero bytes: `P4Failed`.

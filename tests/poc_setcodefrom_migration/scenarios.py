@@ -14,14 +14,11 @@ from execution_testing import (
     Address,
     Alloc,
     AuthorizationTuple,
-    Block,
     Fork,
     Hash,
-    Initcode,
     Transaction,
     TransactionLog,
     TransactionReceipt,
-    compute_create_address,
 )
 
 from .contracts import (
@@ -36,6 +33,7 @@ from .contracts import (
     error,
     migration_check_code,
     migrator_code,
+    migrator_initcode,
     verifier_code,
 )
 from .helpers import MIGRATION_TUPLE, Migration
@@ -43,6 +41,7 @@ from .test_m1_route_a import (
     GAS_LIMIT,
     KERNEL,
     Deployment,
+    creation_block,
     record,
     recorded,
     selector_word,
@@ -55,38 +54,15 @@ with_form = pytest.mark.parametrize(
 
 def deploy_with_ecrecover(pre: Alloc, ecrecover: Address) -> Deployment:
     """
-    Deploy like `test_m1_route_a.deploy`, but with a `MigrationCheck` that
-    calls `ecrecover` instead of the precompile (TEST ONLY), and a Migrator
-    bound to it.
+    Deploy like `test_m1_route_a.deploy`, but from a Migrator initcode
+    whose `MigrationCheck` calls `ecrecover` instead of the precompile
+    (TEST ONLY); Migrator creates that `MigrationCheck`.
     """
     verifier = pre.deploy_contract(verifier_code())
     template = pre.deploy_contract(KERNEL)
-    deployer = pre.fund_eoa()
-    migrator = compute_create_address(address=deployer, nonce=0)
-    check = compute_create_address(address=deployer, nonce=1)
-    block = Block(
-        txs=[
-            Transaction(
-                sender=deployer,
-                nonce=0,
-                to=None,
-                data=Initcode(deploy_code=migrator_code(migrator, check)),
-                gas_limit=GAS_LIMIT,
-                expected_receipt=TransactionReceipt(status=1),
-            ),
-            Transaction(
-                sender=deployer,
-                nonce=1,
-                to=None,
-                data=Initcode(
-                    deploy_code=migration_check_code(migrator, ecrecover)
-                ),
-                gas_limit=GAS_LIMIT,
-                expected_receipt=TransactionReceipt(status=1),
-            ),
-        ]
-    )
-    return Deployment(verifier, template, migrator, check, block)
+    migrator, check, block = creation_block(pre, migrator_initcode(ecrecover))
+    check_hash = code_hash(migration_check_code(migrator, ecrecover))
+    return Deployment(verifier, template, migrator, check, check_hash, block)
 
 
 def migrated_log(
@@ -207,10 +183,15 @@ def delegated_to(
 
 
 def check_post(deployment: Deployment, ecrecover: Address) -> Dict:
-    """Return the deployed code of Migrator and its MigrationCheck."""
+    """
+    Return the code that Migrator's and its MigrationCheck's constructors
+    must have written, for a deployment from `deploy_with_ecrecover`.
+    """
     return {
         deployment.migrator: Account(
-            code=migrator_code(deployment.migrator, deployment.check)
+            code=migrator_code(
+                deployment.migrator, deployment.check, deployment.check_hash
+            )
         ),
         deployment.check: Account(
             code=migration_check_code(deployment.migrator, ecrecover)
